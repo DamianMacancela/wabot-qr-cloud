@@ -23,7 +23,7 @@ import makeWASocket, {
   downloadMediaMessage
 } from '@whiskeysockets/baileys';
 import { createClient } from '@supabase/supabase-js';
-import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { spawn } from 'node:child_process';
 import http from 'node:http';
@@ -75,13 +75,20 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, {
 
 let latestQrData = null;
 let sockInstance = null;
+let isWhatsAppConnected = false;
 const ownerFlowState = new Map();
 
 // ============================================================================
 // 2. PERSISTENCIA EN LA NUBE DE LA SESIÓN WHATSAPP (SIN DEPENDER DE TU PC)
 // ============================================================================
 async function backupAuthToSupabase() {
-  if (!existsSync(join(AUTH_DIR, 'creds.json'))) return;
+  if (!isWhatsAppConnected) return;
+  const credsPath = join(AUTH_DIR, 'creds.json');
+  if (!existsSync(credsPath)) return;
+  try {
+    const creds = JSON.parse(readFileSync(credsPath, 'utf-8'));
+    if (creds.registered !== true) return;
+  } catch (_) { return; }
   const allFiles = readdirSync(AUTH_DIR).filter(f => f.endsWith('.json'));
   const files = {};
   for (const f of allFiles) {
@@ -162,10 +169,25 @@ async function restoreAuthFromSupabase() {
 
   if (!savedFiles || typeof savedFiles !== 'object') return false;
 
+  // Si creds.json no está registrado con WhatsApp, omitir para permitir que Baileys emita un QR limpio
+  if (savedFiles['creds.json']) {
+    try {
+      const parsedCreds = JSON.parse(savedFiles['creds.json']);
+      if (parsedCreds.registered !== true) {
+        console.log('[Cloud Auth] Credenciales en Supabase incompletas (registered !== true). Omitiendo para nuevo QR.');
+        return false;
+      }
+    } catch (_) {
+      return false;
+    }
+  } else {
+    return false;
+  }
+
   for (const [fileName, content] of Object.entries(savedFiles)) {
     writeFileSync(join(AUTH_DIR, fileName), content, 'utf-8');
   }
-  console.log(`[Cloud Auth] Sesión restaurada desde Supabase (${Object.keys(savedFiles).length} archivos).`);
+  console.log(`[Cloud Auth] Sesión válida restaurada desde Supabase (${Object.keys(savedFiles).length} archivos).`);
   return true;
 }
 
@@ -764,6 +786,23 @@ async function processIncomingMessage({ senderPhone, text, msg, sendReply, myPho
 // 11. ARRANQUE AUTÓNOMO DE BAILEYS EN LA NUBE (SIN DEPENDER DE LA PC)
 // ============================================================================
 async function startBot() {
+  if (!existsSync(AUTH_DIR)) mkdirSync(AUTH_DIR, { recursive: true });
+
+  const localCredsPath = join(AUTH_DIR, 'creds.json');
+  if (existsSync(localCredsPath)) {
+    try {
+      const c = JSON.parse(readFileSync(localCredsPath, 'utf-8'));
+      if (c.registered !== true) {
+        console.log('[Baileys] creds.json local no está registrado. Limpiando para generar nuevo código QR...');
+        rmSync(AUTH_DIR, { recursive: true, force: true });
+        mkdirSync(AUTH_DIR, { recursive: true });
+      }
+    } catch (_) {
+      rmSync(AUTH_DIR, { recursive: true, force: true });
+      mkdirSync(AUTH_DIR, { recursive: true });
+    }
+  }
+
   await restoreAuthFromSupabase();
 
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
@@ -781,20 +820,36 @@ async function startBot() {
 
   sock.ev.on('creds.update', async () => {
     await saveCreds();
-    await backupAuthToSupabase();
+    if (isWhatsAppConnected) {
+      await backupAuthToSupabase();
+    }
   });
 
   sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update;
-    if (qr) latestQrData = qr;
+    if (qr) {
+      latestQrData = qr;
+      isWhatsAppConnected = false;
+      console.log('[Baileys] Código QR generado y listo para vincular en /qr');
+    }
 
     if (connection === 'close') {
+      isWhatsAppConnected = false;
       const code = lastDisconnect?.error?.output?.statusCode;
-      if (code !== DisconnectReason.loggedOut) {
-        setTimeout(startBot, 4000);
+      console.log(`[Baileys Conexión Cerrada] Código: ${code}`);
+      if (code === DisconnectReason.loggedOut || code === 401) {
+        console.log('[Baileys] Sesión desvinculada por WhatsApp. Limpiando credenciales para solicitar nuevo QR...');
+        latestQrData = null;
+        try {
+          if (existsSync(AUTH_DIR)) rmSync(AUTH_DIR, { recursive: true, force: true });
+          await supabase.from('pending_uploads').delete().eq('phone', '__baileys_auth__');
+        } catch (_) {}
       }
+      setTimeout(startBot, 4000);
     } else if (connection === 'open') {
+      isWhatsAppConnected = true;
       latestQrData = null;
+      console.log('✅ [Baileys Open] ¡WhatsApp Conectado exitosamente en Render!');
       await backupAuthToSupabase();
       console.log(
         `[WaBot.AI 2079] Cloud autónomo activo. Cuenta recaudadora configurada: ${WABOT_BILLING_INFO.bank_name} ${maskEnd(WABOT_BILLING_INFO.account_number, 4)} (C.I. ${maskEnd(WABOT_BILLING_INFO.beneficiary_id, 2)})`
@@ -840,11 +895,30 @@ const server = http.createServer((req, res) => {
     res.end(JSON.stringify({
       ok: true,
       autonomous_cloud: true,
-      whatsapp_connected: Boolean(sockInstance?.user),
+      whatsapp_connected: isWhatsAppConnected,
       billing_bank: WABOT_BILLING_INFO.bank_name,
       billing_account_masked: maskEnd(WABOT_BILLING_INFO.account_number, 4),
       uptime_seconds: Math.floor(process.uptime())
     }));
+    return;
+  }
+
+  if (url.pathname === '/reset' || url.pathname === '/desvincular') {
+    isWhatsAppConnected = false;
+    latestQrData = null;
+    try {
+      if (existsSync(AUTH_DIR)) rmSync(AUTH_DIR, { recursive: true, force: true });
+      mkdirSync(AUTH_DIR, { recursive: true });
+      supabase.from('pending_uploads').delete().eq('phone', '__baileys_auth__').then(() => {});
+      if (sockInstance) {
+        try { sockInstance.end(new Error('Reset solicitado')); } catch (_) {}
+      }
+    } catch (e) {
+      console.error('[Reset Error]:', e.message);
+    }
+    setTimeout(startBot, 1000);
+    res.writeHead(302, { Location: '/qr' });
+    res.end();
     return;
   }
 
@@ -855,25 +929,49 @@ const server = http.createServer((req, res) => {
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <meta http-equiv="refresh" content="8" />
+  <meta http-equiv="refresh" content="5" />
   <title>WaBot.AI 2079 EDGE — Vinculación Cloud 24/7</title>
   <style>
-    body { font-family: system-ui, sans-serif; background: #0f172a; color: #f8fafc; text-align: center; padding: 32px; }
-    .card { max-width: 480px; margin: 0 auto; background: #1e293b; padding: 28px; border-radius: 16px; }
-    .ok { color: #22c55e; font-weight: 700; }
+    * { box-sizing: border-box; }
+    body { font-family: system-ui, -apple-system, sans-serif; background: #0f172a; color: #f8fafc; text-align: center; padding: 24px 16px; margin: 0; }
+    .card { max-width: 500px; margin: 0 auto; background: #1e293b; padding: 28px 20px; border-radius: 16px; box-shadow: 0 10px 30px rgba(0,0,0,0.5); }
+    h2 { margin-top: 0; color: #38bdf8; font-size: 22px; }
+    .ok { color: #22c55e; font-weight: 700; font-size: 16px; line-height: 1.6; }
+    .waiting { color: #f59e0b; font-weight: 600; font-size: 16px; }
+    .instructions { background: #0f172a; border-radius: 12px; padding: 14px 16px; margin: 18px 0; text-align: left; font-size: 14px; line-height: 1.7; color: #cbd5e1; border: 1px solid #334155; }
+    .instructions ol { margin: 6px 0 0 0; padding-left: 20px; }
+    .qr-box { background: #ffffff; padding: 14px; border-radius: 16px; display: inline-block; box-shadow: 0 8px 25px rgba(0,0,0,0.4); margin: 10px auto; }
+    .btn { display: inline-block; background: #ef4444; color: #ffffff; padding: 10px 20px; border-radius: 8px; text-decoration: none; font-weight: 700; margin-top: 14px; font-size: 14px; }
+    .btn-secondary { background: #475569; }
   </style>
 </head>
 <body>
   <div class="card">
-    <h2>🤖 WaBot.AI 2079 EDGE — Nube Autónoma 24/7</h2>
-    <p class="ok">${
-      sockInstance?.user
-        ? '✅ WhatsApp Vinculado y Persistente en Supabase (Puedes apagar tu PC con total tranquilidad)'
+    <h2>🤖 WaBot.AI 2079 EDGE — Nube Autónoma</h2>
+    ${
+      isWhatsAppConnected
+        ? `<p class="ok">✅ ¡WhatsApp Vinculado y Activo en la Nube!<br/><span style="font-size:13px;color:#94a3b8;font-weight:400;">El bot está operando 24/7 en Render. Puedes apagar tu PC con total seguridad.</span></p>
+           <a href="/reset" class="btn" onclick="return confirm('¿Deseas desvincular y conectar otro número de WhatsApp?')">🔄 Desvincular y Escanear Otro Número</a>`
         : latestQrData
-          ? '📲 Escanea este QR una sola vez para dejar tu bot corriendo 24/7 en la nube:'
-          : '⏳ Generando código QR en la nube...'
-    }</p>
-    ${latestQrData ? `<img src="https://api.qrserver.com/v1/create-qr-code/?size=280x280&data=${encodeURIComponent(latestQrData)}" style="background:#fff;padding:12px;border-radius:12px;" />` : ''}
+          ? `<p class="waiting">📲 Escanea este código QR con WhatsApp:</p>
+             <div class="instructions">
+               <strong>Instrucciones de vinculación:</strong>
+               <ol>
+                 <li>Abre <b>WhatsApp</b> en tu celular.</li>
+                 <li>Ve a <b>Menú (tres puntos)</b> o <b>Ajustes</b> > <b>Dispositivos vinculados</b>.</li>
+                 <li>Toca <b>Vincular un dispositivo</b> y apunta la cámara a este código QR:</li>
+               </ol>
+             </div>
+             <div class="qr-box">
+               <img src="https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(latestQrData)}" width="260" height="260" style="display:block;" alt="Código QR WhatsApp" />
+             </div>
+             <p style="font-size:12px;color:#94a3b8;margin-top:10px;">⏳ El código se actualiza automáticamente cada 5 segundos si expira.</p>
+             <a href="/reset" class="btn btn-secondary">🔄 Forzar Nuevo Código QR</a>`
+          : `<p class="waiting">⏳ Generando código QR en la nube...</p>
+             <p style="color:#94a3b8;font-size:14px;">Iniciando socket con Baileys... Aparecerá en unos segundos.</p>
+             <div style="font-size:36px;margin:20px 0;">⏳</div>
+             <a href="/reset" class="btn btn-secondary">🔄 Reiniciar Conexión</a>`
+    }
   </div>
 </body>
 </html>`);
@@ -883,6 +981,7 @@ const server = http.createServer((req, res) => {
   res.writeHead(302, { Location: '/qr' });
   res.end();
 });
+
 
 function startExternalKeepAlive() {
   if (!RENDER_EXTERNAL_URL) return;
