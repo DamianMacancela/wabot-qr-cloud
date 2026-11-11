@@ -17,6 +17,8 @@
 
 import 'dotenv/config';
 import makeWASocket, {
+  Browsers,
+  makeCacheableSignalKeyStore,
   useMultiFileAuthState,
   DisconnectReason,
   fetchLatestBaileysVersion,
@@ -810,10 +812,19 @@ async function startBot() {
 
   const sock = makeWASocket({
     version,
-    auth: state,
-    logger: pino({ level: 'silent' }),
-    printQRInTerminal: true,
-    browser: ['WaBot-2079-Edge-Cloud', 'Chrome', '122.0.0']
+    auth: {
+      creds: state.creds,
+      keys: makeCacheableSignalKeyStore(state.keys, pino({ level: 'silent' }))
+    },
+    logger: pino({ level: 'warn' }),
+    printQRInTerminal: false,
+    browser: Browsers.ubuntu('Chrome'),
+    syncFullHistory: false,
+    generateHighQualityLinkPreview: false,
+    connectTimeoutMs: 60000,
+    defaultQueryTimeoutMs: 60000,
+    keepAliveIntervalMs: 25000,
+    markOnlineOnConnect: false
   });
 
   sockInstance = sock;
