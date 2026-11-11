@@ -1,0 +1,43 @@
+services:
+  - type: web
+    name: wabot-qr-cloud
+    runtime: node
+    plan: free
+    region: oregon
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: SUPABASE_URL
+        value: https://kjlhfagixbafscwfwbak.supabase.co
+      - key: SUPABASE_SERVICE_KEY
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GEMINI_MODEL
+        value: gemini-3.5-flash-lite
+      - key: SUPERADMIN_PHONE
+        value: "593983476198"
+      - key: PRIVACY_URL
+        value: https://wa-saas-worker.lopdp-bot.workers.dev/privacidad
+      - key: AUTH_ENCRYPTION_KEY
+        value: c61ce796e36f0bf563f2f2dc5eb58202ed5c8958ac8077797353ac7183117359
+      - key: DEFAULT_TENANT_UUID
+        value: "41d1bc9f-ff83-4737-b357-e06e39c8a8df"
+      - key: RENDER_EXTERNAL_URL
+        value: https://wabot-qr-cloud.onrender.com
+      - key: WABOT_BANK_NAME
+        value: "Banco Pichincha"
+      - key: WABOT_ACCOUNT_TYPE
+        value: "Cuenta Transaccional (Ahorros/Corriente)"
+      - key: WABOT_ACCOUNT_NUMBER
+        value: "2214430178"
+      - key: WABOT_BENEFICIARY_NAME
+        value: "Damian Fabricio Macancela Caguana"
+      - key: WABOT_BENEFICIARY_ID
+        value: "0107003048"
+      - key: PORT
+        value: "3000"
