@@ -37,6 +37,16 @@ import http from 'node:http';
 import pino from 'pino';
 
 // ============================================================================
+// ESCUDO ANTI-CRASH GLOBAL (PREVIENE ERROR 502 BAD GATEWAY EN RENDER)
+// ============================================================================
+process.on('uncaughtException', (err) => {
+  console.error('🛡️ [Anti-Crash uncaughtException]:', err?.message || err);
+});
+process.on('unhandledRejection', (reason) => {
+  console.error('🛡️ [Anti-Crash unhandledRejection]:', reason?.message || reason);
+});
+
+// ============================================================================
 // 1. VARIABLES DE ENTORNO Y CONFIGURACIÓN
 // ============================================================================
 const PORT = Number(process.env.PORT || 3000);
@@ -321,207 +331,18 @@ Mensaje: "${t}"`;
   const parts = [{ text: extractPrompt }];
   if (mediaPart) parts.push(mediaPart);
 
-  const aiRes = await gemini({
-    contents: [{ role: 'user', parts }],
-    maxOutputTokens: 800,
-    jsonMode: true
-  });
-
-  const ext = parseAIExtraction(extractTextFromParts(aiRes?.candidates?.[0]?.content?.parts));
-  const newCtx = { ...(tenant.custom_context || {}) };
-  const updateRow = {};
-
-  if (ext.nombre_negocio) {
-    updateRow.name = ext.nombre_negocio;
-    newCtx.contexto_configurado = true;
+  try {
+    const aiRes = await gemini({
+      systemInstruction: sysPrompt,
+      contents: [{ role: 'user', parts: [{ text }] }],
+      maxOutputTokens: 200
+    });
+    const reply = extractTextFromParts(aiRes?.candidates?.[0]?.content?.parts);
+    if (reply) await sendReply(reply);
+  } catch (aiErr) {
+    console.error('[Gemini AI Fallback]:', aiErr.message);
+    await sendReply(`👋 ¡Hola! En este momento estoy recibiendo muchos pedidos. ¿Deseas consultar nuestro menú oficial? Escribe *menu* para ver la lista completa.`);
   }
-  if (ext.direccion) updateRow.address = ext.direccion;
-  if (ext.horario) {
-    const [open, close] = String(ext.horario).split('-').map(s => s.trim());
-    if (open) updateRow.open_time = open;
-    if (close) updateRow.close_time = close;
-  }
-  if (ext.giro) {
-    newCtx.giro = ext.giro;
-    newCtx.contexto_configurado = true;
-  }
-  if (ext.costo_envio !== null && ext.costo_envio !== undefined) newCtx.costo_envio = Number(ext.costo_envio) || 0;
-  if (ext.datos_bancarios) newCtx.datos_bancarios = ext.datos_bancarios;
-  if (ext.titular_cuenta_ocr) newCtx.titular_cuenta_ocr = ext.titular_cuenta_ocr;
-  if (ext.acepta_tc !== null && ext.acepta_tc !== undefined) newCtx.acepta_tc = Boolean(ext.acepta_tc);
-  if (ext.terminos_condiciones) newCtx.terminos_condiciones = ext.terminos_condiciones;
-  if (ext.es_qr_pago) newCtx.payment_qr_received = true;
-
-  updateRow.custom_context = newCtx;
-  await supabase.from('merchants').update(updateRow).eq('id', tenant.id);
-
-  if (Array.isArray(ext.items) && ext.items.length > 0) {
-    await supabase.from('menu_items').delete().eq('merchant_id', tenant.id);
-    const rows = ext.items.map(i => ({
-      merchant_id: tenant.id,
-      name: String(i.nombre || 'Producto').slice(0, 100),
-      price: Number(i.precio) || 0,
-      category: String(i.categoria || 'General').slice(0, 50),
-      available: true
-    }));
-    await supabase.from('menu_items').insert(rows);
-  }
-
-  const refreshed = await getTenantBundle(true);
-  const stillMissing = checkMissingSetupFields(refreshed.data, refreshed.items);
-
-  if (stillMissing.length > 0) {
-    onboardingState.set(senderPhone, { stage: 'awaiting_setup' });
-    const pendingList = stillMissing.map(m =>
-      m === 'contexto' ? '• *Contexto de tu negocio:* Nombre del local, giro, dirección y horario.' :
-      m === 'menu' ? '• *Tu Menú o lista de precios:* Escribe tus productos con precios o envía una foto.' :
-      '• *Tu QR de Deuna! o Cuenta Bancaria:* Envía la imagen de tu QR o tu número de cuenta para cobrar.'
-    ).join('\n');
-
-    await ctx.send(
-      `✅ *¡Guardado con éxito!*\n\n` +
-      `Para completar la configuración inicial, envíame ahora:\n${pendingList}`
-    );
-    return true;
-  }
-
-  onboardingState.delete(senderPhone);
-  const webUrl = refreshed.data.website_url || `https://wa-saas-worker.lopdp-bot.workers.dev/b/${refreshed.data.slug}`;
-  const menuUrl = refreshed.data.menu_url || `https://wa-saas-worker.lopdp-bot.workers.dev/b/${refreshed.data.slug}/menu`;
-
-  await ctx.send(
-    `🎉 *¡Configuración 100% Lista!*\n\n` +
-    `• *Negocio:* ${refreshed.data.name} (${newCtx.giro})\n` +
-    `• *Productos activos:* ${refreshed.items.length}\n` +
-    `• *Web:* ${webUrl}\n` +
-    `• *Menú QR:* ${menuUrl}\n\n` +
-    `Ya estoy atendiendo a tus clientes de forma autónoma 24/7. Escribe *configurar* cuando desees actualizar tu contexto o menú.`
-  );
-  return true;
-}
-
-// ============================================================================
-// 7. RESPUESTAS DE 0 TOKENS PARA CLIENTES Y PROMPT COMPACTO
-// ============================================================================
-function tryZeroTokenCustomerReply(tenant, items, text, isFirstMessage) {
-  const clean = normalizeText(text);
-  const ctx = tenant.custom_context || {};
-  const isAllInOne = tenant.plan === 'all_in_one' || tenant.plan === 'trial';
-  const webUrl = tenant.website_url || `https://wa-saas-worker.lopdp-bot.workers.dev/b/${tenant.slug}`;
-  const menuUrl = tenant.menu_url || `https://wa-saas-worker.lopdp-bot.workers.dev/b/${tenant.slug}/menu`;
-
-  const introHeader = isFirstMessage
-    ? `👋 ¡Hola! Soy el Asistente Virtual de *${tenant.name}* (${ctx.giro || 'Comercio'}), impulsado por *WaBot.AI 2079 EDGE*.\n` +
-      `Brindo precios oficiales, menú digital, toma de pedidos y validación de pagos Deuna! bajo la *LOPDP Ecuador* (uso moderado de datos, retención 10 días; escribe *mis datos* o *borrar mis datos*).\n\n`
-    : '';
-
-  if (/^(hola|buenas|buenos dias|buenas tardes|buenas noches|info|informacion|inicio)$/.test(clean)) {
-    const sample = items.slice(0, 6).map(i => `• *${i.name}:* $${Number(i.price).toFixed(2)}`).join('\n');
-    return (
-      `${introHeader || `👋 ¡Bienvenido a *${tenant.name}*!\n\n`}` +
-      `🕒 *Horario:* ${tenant.open_time || '09:00'} - ${tenant.close_time || '20:00'} | 📍 ${tenant.address || tenant.city || 'Ecuador'}\n\n` +
-      `📋 *Nuestro Catálogo:*\n${sample}\n\n` +
-      (isAllInOne ? `🍽️ *Menú Digital QR:* ${menuUrl}\n🌐 *Web:* ${webUrl}\n\n` : '') +
-      `¿Qué deseas pedir hoy?`
-    );
-  }
-
-  if (/^(menu|catalogo|precios|lista de precios|carta|que venden)$/.test(clean)) {
-    const list = items.map(i => `• *${i.name}:* $${Number(i.price).toFixed(2)}`).join('\n');
-    return (
-      `${introHeader}📖 *MENÚ Y PRECIOS — ${tenant.name}*\n\n${list}\n\n` +
-      `🚚 *Envío:* $${Number(ctx.costo_envio || 0).toFixed(2)}\n` +
-      (isAllInOne ? `🛒 *Pide en el Menú QR:* ${menuUrl}` : `Escribe los productos que deseas ordenar.`)
-    );
-  }
-
-  if (/^(cuenta|deuna|transferencia|qr|datos bancarios|como pago|metodos de pago)$/.test(clean)) {
-    return (
-      `${introHeader}💳 *DATOS DE PAGO — ${tenant.name}*\n\n` +
-      `• *Deuna! / Cuenta:* ${ctx.datos_bancarios || 'Confirmar al cerrar el pedido'}\n` +
-      `• *Titular:* ${ctx.titular_cuenta_ocr || tenant.name}\n` +
-      `• *Tarjeta de Crédito (TC):* ${ctx.acepta_tc ? 'Aceptada' : 'No habilitada'}\n\n` +
-      `📸 Envía la captura de tu comprobante por aquí para validarlo automáticamente.`
-    );
-  }
-
-  return null;
-}
-
-function buildCompactSystemPrompt(tenant, items = [], includeIntro = false) {
-  const ctx = tenant.custom_context || {};
-  const isAllInOne = tenant.plan === 'all_in_one' || tenant.plan === 'trial';
-  const menuUrl = tenant.menu_url || `https://wa-saas-worker.lopdp-bot.workers.dev/b/${tenant.slug}/menu`;
-  const compactCatalog = items.map(i => `${i.name}:$${Number(i.price).toFixed(2)}`).join(' | ');
-
-  return `Asistente comercial de "${tenant.name}" (${ctx.giro || 'Comercio'}, ${tenant.address || tenant.city || 'Ecuador'}, ${tenant.open_time || '09:00'}-${tenant.close_time || '20:00'}).
-${includeIntro ? 'Inicia presentándote en 1 línea como Asistente IA de ' + tenant.name + ' (WaBot.AI 2079, LOPDP retención 10 días).' : ''}
-Precios USD: ${compactCatalog}.
-Envío: $${Number(ctx.costo_envio || 0).toFixed(2)}. Pagos: ${ctx.datos_bancarios || 'Deuna/Transferencia'}. TC: ${ctx.acepta_tc ? 'Sí' : 'No'}.
-${isAllInOne ? `Menú QR: ${menuUrl}` : ''}
-Sé breve (máximo 4 líneas). No inventes precios ni productos.`;
-}
-
-// ============================================================================
-// 8. PROCESADOR CENTRAL DE MENSAJES
-// ============================================================================
-async function processIncomingMessage({ senderPhone, text, msg, sendReply }) {
-  const { data: tenant, items } = await getTenantBundle();
-  if (!tenant) return;
-
-  const cleanLower = (text || '').trim().toLowerCase();
-
-  if (cleanLower === 'mis datos' || cleanLower === 'consultar mis datos') {
-    const { data: arco } = await supabase.rpc('export_customer_data', { p_tenant: tenant.id, p_phone: senderPhone });
-    await sendReply(
-      `📄 *REPORTE LOPDP ECUADOR (Art. 13)*\n• *Teléfono:* +${senderPhone}\n• *Pedidos:* ${arco?.pedidos?.length || 0}\n• *Uso moderado (Art. 10):* Chats eliminados a los 10 días. Escribe *borrar mis datos* para anonimizar ahora.`
-    );
-    return;
-  }
-
-  if (cleanLower === 'borrar mis datos' || cleanLower === 'eliminar mis datos') {
-    await supabase.rpc('anonymize_customer', { p_tenant: tenant.id, p_phone: senderPhone });
-    await sendReply(`🔒 *Datos anonimizados irreversiblemente (Art. 15 LOPDP Ecuador).*`);
-    return;
-  }
-
-  // Verificar si falta el contexto, menú o QR del negocio (pide el contexto de forma autónoma al iniciar)
-  const handledBySetup = await handleAutonomousSetup({
-    ctx: { send: sendReply },
-    tenant,
-    items,
-    senderPhone,
-    text,
-    msg
-  });
-  if (handledBySetup) return;
-
-  const isFirstMsg = !greetedUsers.has(senderPhone);
-  greetedUsers.add(senderPhone);
-
-  const zeroTokenReply = tryZeroTokenCustomerReply(tenant, items, text, isFirstMsg);
-  if (zeroTokenReply) {
-    await sendReply(zeroTokenReply);
-    return;
-  }
-
-  const { data: quotaAi } = await supabase.rpc('check_and_consume_quota', { p_tenant: tenant.id, p_metric: 'ai' });
-  if (!quotaAi?.allowed) {
-    await sendReply(
-      `🔒 *Periodo de prueba de 10 días finalizado.*\nPara activar tu plan mensual ($19.99 o $29.99), transfiere a *${WABOT_BILLING_INFO.bank_name}* (${WABOT_BILLING_INFO.account_type} \`${WABOT_BILLING_INFO.account_number}\`, Titular: ${WABOT_BILLING_INFO.beneficiary_name}, C.I. \`${WABOT_BILLING_INFO.beneficiary_id}\`) y envía la captura.`
-    );
-    return;
-  }
-
-  const sysPrompt = buildCompactSystemPrompt(tenant, items, isFirstMsg);
-  const aiRes = await gemini({
-    systemInstruction: sysPrompt,
-    contents: [{ role: 'user', parts: [{ text }] }],
-    maxOutputTokens: 200
-  });
-
-  const reply = extractTextFromParts(aiRes?.candidates?.[0]?.content?.parts);
-  if (reply) await sendReply(reply);
 }
 
 // ============================================================================
@@ -611,20 +432,23 @@ async function startBot(forceWipe = false) {
       // Apenas conecta por primera vez, el bot envía de forma autónoma el mensaje pidiendo el contexto del negocio
       if (!welcomeSentOnOpen) {
         welcomeSentOnOpen = true;
-        try {
-          const myJid = sock.user?.id?.replace(/:\d+@/, '@');
-          const myPhone = (myJid || '').replace(/@.+$/, '').replace(/[^\d]/g, '');
-          const { data: tenant, items } = await getTenantBundle(true);
-          const missing = checkMissingSetupFields(tenant, items);
-          const targetFields = missing.length > 0 ? missing : ['contexto', 'menu', 'qr_cobro'];
+        setTimeout(async () => {
+          try {
+            const myJid = sock.user?.id?.replace(/:\d+@/, '@');
+            const myPhone = (myJid || '').replace(/@.+$/, '').replace(/[^\d]/g, '');
+            const { data: tenant, items } = await getTenantBundle(true);
+            const missing = checkMissingSetupFields(tenant, items);
+            const targetFields = missing.length > 0 ? missing : ['contexto', 'menu', 'qr_cobro'];
 
-          if (myJid) {
-            onboardingState.set(myPhone, { stage: 'awaiting_setup' });
-            await sock.sendMessage(myJid, { text: buildBotSelfIntroductionPrompt(targetFields) });
+            if (myJid && sock && sock.user) {
+              onboardingState.set(myPhone, { stage: 'awaiting_setup' });
+              await sock.sendMessage(myJid, { text: buildBotSelfIntroductionPrompt(targetFields) });
+              console.log('✅ [Welcome Sent] Prompt inicial enviado por WhatsApp con éxito.');
+            }
+          } catch (err) {
+            console.error('[Welcome Prompt Error]:', err.message);
           }
-        } catch (err) {
-          console.error('[Welcome Prompt Error]:', err.message);
-        }
+        }, 3000);
       }
     }
   });
@@ -632,24 +456,36 @@ async function startBot(forceWipe = false) {
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
     if (type !== 'notify') return;
     for (const msg of messages) {
-      if (!msg.message || msg.key.fromMe) continue;
-      const remoteJid = msg.key.remoteJid || '';
-      if (remoteJid.endsWith('@g.us') || remoteJid === 'status@broadcast') continue;
+      try {
+        if (!msg.message || msg.key.fromMe) continue;
+        const remoteJid = msg.key.remoteJid || '';
+        if (remoteJid.endsWith('@g.us') || remoteJid === 'status@broadcast') continue;
 
-      const senderPhone = remoteJid.replace(/@.+$/, '').replace(/[^\d]/g, '');
-      const text =
-        msg.message.conversation ||
-        msg.message.extendedTextMessage?.text ||
-        msg.message.imageMessage?.caption ||
-        msg.message.documentMessage?.caption ||
-        '';
+        const senderPhone = remoteJid.replace(/@.+$/, '').replace(/[^\d]/g, '');
+        const text =
+          msg.message.conversation ||
+          msg.message.extendedTextMessage?.text ||
+          msg.message.imageMessage?.caption ||
+          msg.message.documentMessage?.caption ||
+          '';
 
-      await processIncomingMessage({
-        senderPhone,
-        text,
-        msg,
-        sendReply: async (replyText) => sock.sendMessage(remoteJid, { text: replyText })
-      });
+        await processIncomingMessage({
+          senderPhone,
+          text,
+          msg,
+          sendReply: async (replyText) => {
+            try {
+              if (sock && sock.user) {
+                await sock.sendMessage(remoteJid, { text: replyText });
+              }
+            } catch (sendErr) {
+              console.error('[Send Reply Error]:', sendErr.message);
+            }
+          }
+        });
+      } catch (loopErr) {
+        console.error('[Message Loop Error]:', loopErr.message);
+      }
     }
   });
 }
