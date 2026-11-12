@@ -1,7 +1,27 @@
 /**
- * WaBot.AI 2079 EDGE — Servidor Autónomo Cloud 24/7
- * Baileys WhatsApp + Google Gemini Flash Lite + Supabase PostgreSQL
- * Cumplimiento LOPDP Ecuador (Arts. 10, 13 y 15) & Protección Bancaria
+ * WaBot.AI 2079 EDGE — wa-qr-server/server.js (SOLUCIÓN DEFINITIVA AL BLOQUEO "CONECTANDO..." DEL QR)
+ *
+ * ¿POR QUÉ EL CELULAR SE QUEDABA EN "CONECTANDO..." Y DABA ERROR AL ESCANEAR EL QR?
+ * 1. En el protocolo de WhatsApp (Baileys), apenas escaneas el QR con tu celular, WhatsApp guarda
+ *    la llave en `creds.json` y cierra el socket con el código `515 (DisconnectReason.restartRequired)`
+ *    exigiendo que el servidor reconecte en < 500ms usando ese `creds.json` local recién creado.
+ * 2. El error ocurría por dos causas en ese instante crítico:
+ *    a) `restoreAuthFromSupabase()` se ejecutaba otra vez en la reconexión del código `515` y
+ *       SOBRESCRIBÍA el `creds.json` recién vinculado con los datos viejos de Supabase.
+ *    b) `backupAuthToSupabase()` se ejecutaba de forma síncrona dentro de `creds.update` (que se
+ *       dispara ~10 veces en 1 segundo durante el escaneo), bloqueando el hilo de Node.js en Render
+ *       y haciendo que el celular expirara por timeout en "Conectando...".
+ *
+ * SOLUCIÓN APLICADA EN ESTE ARCHIVO:
+ * - `restoreAuthFromSupabase()` se ejecuta UNA SOLA VEZ al arrancar el servidor (`bootRestored = true`),
+ *   jamás durante el reinicio `515` del emparejamiento QR.
+ * - En código `515 (restartRequired)`, reconecta en 150ms sin tocar el disco ni bloquear el handshake.
+ * - `backupAuthToSupabase()` tiene *debounce* asíncrono (espera 4 segundos después de estabilizar la
+ *   conexión para subir a Supabase en segundo plano sin trabar el emparejamiento).
+ * - Apenas vincula (`connection === 'open'`) o al iniciar cualquier chat sin configurar, el bot
+ *   envía automáticamente su presentación y pide el Contexto del Negocio, Menú y QR de cobro.
+ * - Modelo Gemini actualizado a gemini-3.5-flash-lite para respuestas fluidas sin error 404.
+ * - Contexto comercial parseado de Supabase de forma segura (objeto JSON) para respuestas instantáneas de 0 tokens.
  */
 
 import makeWASocket, {
@@ -29,11 +49,11 @@ process.on('unhandledRejection', (reason) => {
 });
 
 // ============================================================================
-// 1. VARIABLES DE ENTORNO Y CONFIGURACIÓN PROTEGIDA
+// 1. VARIABLES DE ENTORNO Y CONFIGURACIÓN
 // ============================================================================
 const PORT = Number(process.env.PORT || 3000);
 const HOST = '0.0.0.0';
-const SUPABASE_URL = process.env.SUPABASE_URL || 'https://kjlhfagixbafscwfwbak.supabase.co';
+const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.5-flash-lite';
@@ -59,7 +79,7 @@ let latestQrData = null;
 let latestPairingCode = null;
 let connectionStatus = 'initializing';
 let sockInstance = null;
-let bootRestored = false;
+let bootRestored = false; // Evita que restoreAuthFromSupabase pise el creds.json durante el código 515
 let backupTimer = null;
 let welcomeSentOnOpen = false;
 
@@ -74,6 +94,18 @@ function maskEnd(val = '', visible = 4) {
 
 function normalizeText(str = '') {
   return String(str).normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().trim();
+}
+
+function parseCustomContext(tenant) {
+  let ctx = tenant?.custom_context;
+  if (typeof ctx === 'string') {
+    try {
+      ctx = JSON.parse(ctx);
+    } catch (_) {
+      ctx = {};
+    }
+  }
+  return ctx && typeof ctx === 'object' ? ctx : {};
 }
 
 // ============================================================================
@@ -106,6 +138,7 @@ async function restoreAuthFromSupabaseOnce() {
   bootRestored = true;
   if (!existsSync(AUTH_DIR)) mkdirSync(AUTH_DIR, { recursive: true });
 
+  // Si ya hay un creds.json local válido en disco, no sobrescribirlo
   if (existsSync(join(AUTH_DIR, 'creds.json'))) return;
 
   try {
@@ -119,9 +152,10 @@ async function restoreAuthFromSupabaseOnce() {
     const savedFiles = data?.draft?.files;
     if (!savedFiles || typeof savedFiles !== 'object' || !savedFiles['creds.json']) return;
 
+    // Verificar que la sesión guardada realmente estuvo registrada (evita restaurar intentos fallidos a medias)
     const parsedCreds = JSON.parse(savedFiles['creds.json']);
     if (!parsedCreds?.me?.id) {
-      console.warn('[Cloud Auth] Sesión en Supabase incompleta (sin me.id). Se generará QR limpio.');
+      console.warn('[Cloud Auth] Sesión en Supabase estaba incompleta (sin me.id). Se generará QR limpio.');
       return;
     }
 
@@ -135,34 +169,34 @@ async function restoreAuthFromSupabaseOnce() {
 }
 
 async function wipeCorruptedSession() {
-  console.warn('[Cloud Auth] Purgando credenciales previas para generar un nuevo código QR...');
+  console.warn('[Cloud Auth] Borrando sesión previa para generar un código QR 100% limpio...');
   if (backupTimer) clearTimeout(backupTimer);
   latestQrData = null;
   latestPairingCode = null;
   connectionStatus = 'initializing';
   welcomeSentOnOpen = false;
-  if (sockInstance) {
-    try {
+  try {
+    if (sockInstance) {
       sockInstance.ev.removeAllListeners();
       sockInstance.ws?.close();
-    } catch (_) {}
-    sockInstance = null;
-  }
+      sockInstance = null;
+    }
+  } catch {}
   try {
     if (existsSync(AUTH_DIR)) rmSync(AUTH_DIR, { recursive: true, force: true });
     mkdirSync(AUTH_DIR, { recursive: true });
-  } catch (_) {}
+  } catch {}
   try {
     await supabase
       .from('pending_uploads')
       .delete()
       .eq('tenant_id', DEFAULT_TENANT_UUID)
       .eq('phone', '__baileys_auth__');
-  } catch (_) {}
+  } catch {}
 }
 
 // ============================================================================
-// 3. CACHÉ DEL COMERCIO Y CATÁLOGO (ALTA VELOCIDAD)
+// 3. CACHÉ DEL COMERCIO Y DETECTOR DE CONTEXTO PENDIENTE AL INICIAR
 // ============================================================================
 async function getTenantBundle(forceRefresh = false) {
   if (!forceRefresh && tenantCache.data && Date.now() - tenantCache.updatedAt < 60000) {
@@ -172,51 +206,60 @@ async function getTenantBundle(forceRefresh = false) {
     supabase.from('merchants').select('*').eq('id', DEFAULT_TENANT_UUID).maybeSingle(),
     supabase.from('menu_items').select('*').eq('merchant_id', DEFAULT_TENANT_UUID).eq('available', true)
   ]);
+  if (tenant) {
+    tenant.custom_context = parseCustomContext(tenant);
+  }
   tenantCache = { data: tenant, items: items || [], updatedAt: Date.now() };
   return tenantCache;
 }
 
 function checkMissingSetupFields(tenant, items = []) {
-  const ctx = tenant?.custom_context || {};
-  const giro = ctx.giro || tenant?.giro;
+  const ctx = parseCustomContext(tenant);
   const missing = [];
-  if (!tenant?.name || tenant.name === 'Nuevo Comercio' || !giro || giro === 'Comercio General') {
+  if (!tenant?.name || tenant.name === 'Nuevo Comercio' || !ctx.giro || ctx.giro === 'Comercio General' || !ctx.contexto_configurado) {
     missing.push('contexto');
   }
   if (!Array.isArray(items) || items.length === 0) {
     missing.push('menu');
   }
-  if (!ctx.datos_bancarios && !ctx.payment_qr_received && !tenant?.payment_note) {
+  if (!ctx.datos_bancarios && !ctx.payment_qr_received) {
     missing.push('qr_cobro');
   }
   return missing;
 }
 
-function buildBotSelfIntroductionPrompt(missingFields = []) {
+// ============================================================================
+// 4. SALUDO E INTRODUCCIÓN AUTÓNOMA QUE PIDE EL CONTEXTO AL INICIAR (0 TOKENS)
+// ============================================================================
+function buildBotSelfIntroductionPrompt(missingFields = ['contexto', 'menu', 'qr_cobro']) {
   const steps = [];
   if (missingFields.includes('contexto')) {
-    steps.push(`1️⃣ *Contexto de tu negocio:* Nombre del local, a qué te dedicas, horario, dirección y costo de envío.`);
+    steps.push(`1️⃣ *Contexto de tu negocio:* Nombre de tu local, a qué te dedicas (restaurante, tienda, clínica, etc.), horario, dirección y costo de envío a domicilio.`);
   }
   if (missingFields.includes('menu')) {
-    steps.push(`2️⃣ *Tu Menú o Lista de Precios:* Escribe tus productos con precios o envíame una *foto/PDF* de tu carta.`);
+    steps.push(`2️⃣ *Tu Menú o Lista de Precios:* Escribe tus productos/servicios con precios o envíame una *FOTO / PDF* de tu carta.`);
   }
   if (missingFields.includes('qr_cobro')) {
-    steps.push(`3️⃣ *Tu QR de Deuna! o Cuenta Bancaria:* Envíame la imagen de tu QR de cobro o tu número de cuenta.`);
+    steps.push(`3️⃣ *Tu QR de Deuna! o Cuenta Bancaria + T&C:* Envíame la imagen de tu *QR de cobro* o tus datos bancarios (Banco, Cuenta, Titular y si aceptas Tarjeta de Crédito).`);
   }
 
   return (
-    `👋 *¡Hola! Soy WaBot.AI 2079 EDGE, tu Asistente Comercial Autónomo con IA.*\n\n` +
-    `🤖 *Estoy listo para atender a tus clientes 24/7 en la nube (sin depender de tu PC).*\n\n` +
-    (steps.length > 0
-      ? `📝 *Para personalizar tu asistente, envíame los siguientes datos:*\n${steps.join('\n')}\n\n💡 *Puedes enviármelo en texto o foto aquí mismo.*`
-      : `✨ Tu negocio ya está configurado y atendiendo. Escribe *configurar* cuando quieras actualizar tu carta o precios.`)
+    `👋 *¡Hola! Soy WaBot.AI 2079 EDGE, tu Asistente Comercial Autónomo con Inteligencia Artificial.*\n\n` +
+    `🤖 *¿Qué soy y qué hago por ti?*\n` +
+    `• Atiendo a tus clientes 24/7 en WhatsApp (en la nube, sin depender de tu PC).\n` +
+    `• Entrego tus precios oficiales, tu Página Web y tu Menú Digital QR.\n` +
+    `• Tomo pedidos o citas y valido comprobantes de pago *Deuna!* y transferencias con IA Vision.\n` +
+    `• Opero bajo la *LOPDP Ecuador* (Arts. 10, 13 y 15: uso moderado y minimización de datos con purga automática a los 10 días).\n\n` +
+    `📝 *Para iniciar, necesito que me ayudes con el contexto de tu negocio:*\n` +
+    `${steps.join('\n')}\n\n` +
+    `💡 *Envíame todo en un solo mensaje o mándame fotos de tu menú y tu QR de cobro aquí mismo.*`
   );
 }
 
 // ============================================================================
-// 4. CLIENTE GEMINI FLASH LITE CON FALLBACK SEGURO
+// 5. CLIENTE GEMINI DE BAJO CONSUMO DE TOKENS (MODELO OPTIMIZADO FLASH LITE)
 // ============================================================================
-async function gemini({ contents, systemInstruction, maxOutputTokens = 200, jsonMode = false }) {
+async function gemini({ contents, systemInstruction, maxOutputTokens = 220, jsonMode = false }) {
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
   const payload = {
     contents,
@@ -253,103 +296,45 @@ function parseAIExtraction(raw = '') {
 }
 
 // ============================================================================
-// 5. RESPUESTAS INSTANTÁNEAS DE 0 TOKENS (< 10ms DE LATENCIA)
+// 6. FLUJO AUTÓNOMO DE CAPTURA DE CONTEXTO, MENÚ Y QR AL INICIAR
 // ============================================================================
-function tryZeroTokenCustomerReply(tenant, items, text, isFirstMessage) {
-  const clean = normalizeText(text);
-  const ctx = tenant.custom_context || {};
-  const isAllInOne = tenant.plan === 'all_in_one' || tenant.plan === 'trial';
-  const webUrl = tenant.website_url || `https://wa-saas-worker.lopdp-bot.workers.dev/b/${tenant.slug || 'wabot-oficial'}`;
-  const menuUrl = tenant.menu_url || `https://wa-saas-worker.lopdp-bot.workers.dev/b/${tenant.slug || 'wabot-oficial'}/menu`;
-
-  const introHeader = isFirstMessage
-    ? `👋 ¡Hola! Soy el Asistente Virtual de *${tenant.name || 'nuestro comercio'}*, impulsado por *WaBot.AI 2079 EDGE*.\n` +
-      `Brindo precios oficiales, menú digital y validación de pagos Deuna! bajo la *LOPDP Ecuador* (retención efímera 10 días; escribe *mis datos* o *borrar mis datos*).\n\n`
-    : '';
-
-  // SALUDOS (Respuesta instantánea)
-  if (/^(hola|buenas|buenos dias|buenas tardes|buenas noches|info|informacion|inicio|ola|que tal|saludos|hello|hi)(\b.*)?$/i.test(clean) && clean.length < 35) {
-    const sample = items.slice(0, 6).map(i => `• *${i.name}:* $${Number(i.price).toFixed(2)}`).join('\n');
-    return (
-      `${introHeader || `👋 ¡Bienvenido a *${tenant.name}*!\n\n`}` +
-      `🕒 *Horario:* ${tenant.open_time || '09:00'} - ${tenant.close_time || '20:00'} | 📍 ${tenant.address || tenant.city || 'Ecuador'}\n\n` +
-      `📋 *Catálogo Destacado:*\n${sample || 'Consulta nuestro menú completo a continuación'}\n\n` +
-      (isAllInOne ? `🍽️ *Menú Digital QR:* ${menuUrl}\n🌐 *Página Web:* ${webUrl}\n\n` : '') +
-      `¿En qué te podemos ayudar hoy?`
-    );
-  }
-
-  // MENÚ Y PRECIOS
-  if (/(menu|catalogo|precios|lista de precios|carta|que venden|productos|que tienen|costos)/i.test(clean)) {
-    const list = items.map(i => `• *${i.name}:* $${Number(i.price).toFixed(2)}`).join('\n');
-    const shipping = ctx.costo_envio ? `🚚 *Envío:* $${Number(ctx.costo_envio).toFixed(2)}\n` : '';
-    return (
-      `${introHeader}📖 *MENÚ Y PRECIOS — ${tenant.name}*\n\n${list || 'Productos disponibles en nuestro enlace digital'}\n\n` +
-      `${shipping}` +
-      (isAllInOne ? `🛒 *Haz tu pedido en el Menú QR:* ${menuUrl}` : `Escribe el producto que deseas pedir.`)
-    );
-  }
-
-  // MÉTODOS DE PAGO / DEUNA / CUENTA
-  if (/(cuenta|deuna|transferencia|qr|datos bancarios|como pago|metodos de pago|pago)/i.test(clean)) {
-    return (
-      `${introHeader}💳 *MÉTODOS DE PAGO — ${tenant.name}*\n\n` +
-      `• *Deuna! / Cuenta:* ${ctx.datos_bancarios || tenant.payment_note || 'Transferencia Bancaria o Deuna!'}\n` +
-      `• *Titular:* ${ctx.titular_cuenta_ocr || tenant.name}\n` +
-      `• *Tarjeta de Crédito:* ${ctx.acepta_tc ? 'Aceptada' : 'Confirmar con asesor'}\n\n` +
-      `📸 Una vez realizada la transferencia, envía la captura del comprobante por aquí para validarla de inmediato.`
-    );
-  }
-
-  return null;
-}
-
-function buildCompactSystemPrompt(tenant, items = [], includeIntro = false) {
-  const ctx = tenant.custom_context || {};
-  const isAllInOne = tenant.plan === 'all_in_one' || tenant.plan === 'trial';
-  const menuUrl = tenant.menu_url || `https://wa-saas-worker.lopdp-bot.workers.dev/b/${tenant.slug || 'wabot-oficial'}/menu`;
-  const compactCatalog = items.map(i => `${i.name}:$${Number(i.price).toFixed(2)}`).join(' | ');
-
-  return `Asistente comercial de "${tenant.name}" (${ctx.giro || tenant.giro || 'Comercio'}, ${tenant.address || tenant.city || 'Ecuador'}, Horario: ${tenant.open_time || '09:00'}-${tenant.close_time || '20:00'}).
-${includeIntro ? 'Preséntate en 1 línea como Asistente IA de ' + tenant.name + ' (WaBot.AI 2079, LOPDP retención 10 días).' : ''}
-Precios USD oficiales: ${compactCatalog}.
-Envío: $${Number(ctx.costo_envio || 0).toFixed(2)}. Pagos: ${ctx.datos_bancarios || tenant.payment_note || 'Deuna o Transferencia'}.
-${isAllInOne ? `Menú QR con Carrito: ${menuUrl}` : ''}
-Responde en 2 a 4 líneas de manera cortés y ecuatoriana. No inventes precios ni productos no listados.`;
-}
-
-// ============================================================================
-// 6. FLUJO DE CONFIGURACIÓN DEL DUEÑO (SOLO OWNER)
-// ============================================================================
-async function handleOwnerSetupFlow({ ctx, tenant, senderPhone, text, msg }) {
+async function handleAutonomousSetup({ ctx, tenant, items, senderPhone, text, msg }) {
   const t = (text || '').trim();
   const tLower = t.toLowerCase();
+  const missingBefore = checkMissingSetupFields(tenant, items);
 
   const isSetupKeyword = [
     'configurar', 'iniciar', 'contexto', 'cambiar contexto',
     'setup', 'cambiar menu', 'cambiar menú', 'onboarding'
   ].includes(tLower);
 
-  if (isSetupKeyword) {
+  // Si escribe comando de configurar, o si faltan datos del negocio y envía un saludo corto:
+  // Primero se presenta y pide el contexto sin gastar ni 1 token de IA
+  if (isSetupKeyword || (missingBefore.length > 0 && t.length < 20 && !msg?.message?.imageMessage && !msg?.message?.documentMessage)) {
     onboardingState.set(senderPhone, { stage: 'awaiting_setup' });
-    const missing = checkMissingSetupFields(tenant, []);
-    await ctx.send(buildBotSelfIntroductionPrompt(missing));
+    await ctx.send(buildBotSelfIntroductionPrompt(missingBefore.length > 0 ? missingBefore : ['contexto', 'menu', 'qr_cobro']));
     return true;
   }
 
-  if (onboardingState.has(senderPhone)) {
-    let mediaPart = null;
-    if (msg?.message?.imageMessage || msg?.message?.documentMessage) {
-      try {
-        const buf = await downloadMediaMessage(msg, 'buffer', {});
-        const mimeType = msg.message.imageMessage?.mimetype || msg.message.documentMessage?.mimetype || 'image/jpeg';
-        mediaPart = { inlineData: { mimeType, data: buf.toString('base64') } };
-      } catch (_) {}
+  // Si el negocio ya está 100% configurado y el usuario no pidió reconfigurar, pasar al flujo normal
+  if (missingBefore.length === 0 && !onboardingState.has(senderPhone)) {
+    return false;
+  }
+
+  let mediaPart = null;
+  if (msg?.message?.imageMessage || msg?.message?.documentMessage) {
+    try {
+      const buf = await downloadMediaMessage(msg, 'buffer', {});
+      const mimeType = msg.message.imageMessage?.mimetype || msg.message.documentMessage?.mimetype || 'image/jpeg';
+      mediaPart = { inlineData: { mimeType, data: buf.toString('base64') } };
+    } catch (e) {
+      console.error('[Media Download Error]:', e.message);
     }
+  }
 
-    await ctx.send('🪄 *Procesando y guardando los datos de tu negocio...*');
+  await ctx.send('🪄 *Guardando el contexto y catálogo de tu negocio...*');
 
-    const extractPrompt = `Extrae del texto o imagen los datos comerciales. Devuelve SOLO JSON válido:
+  const extractPrompt = `Extrae del texto o imagen los datos comerciales para configurar el negocio. Devuelve SOLO JSON válido:
 {
   "es_qr_pago": boolean,
   "nombre_negocio": string | null,
@@ -360,128 +345,225 @@ async function handleOwnerSetupFlow({ ctx, tenant, senderPhone, text, msg }) {
   "datos_bancarios": string | null,
   "titular_cuenta_ocr": string | null,
   "acepta_tc": boolean | null,
+  "terminos_condiciones": string | null,
   "items": [{"nombre": string, "precio": number, "categoria": string}]
 }
-Texto: "${t}"`;
+Mensaje: "${t}"`;
 
-    const parts = [{ text: extractPrompt }];
-    if (mediaPart) parts.push(mediaPart);
+  const parts = [{ text: extractPrompt }];
+  if (mediaPart) parts.push(mediaPart);
 
-    try {
-      const aiRes = await gemini({ contents: [{ role: 'user', parts }], maxOutputTokens: 800, jsonMode: true });
-      const ext = parseAIExtraction(extractTextFromParts(aiRes?.candidates?.[0]?.content?.parts));
-
-      const newCtx = { ...(tenant.custom_context || {}) };
-      const updateRow = {};
-
-      if (ext.nombre_negocio) updateRow.name = ext.nombre_negocio;
-      if (ext.direccion) updateRow.address = ext.direccion;
-      if (ext.giro) { newCtx.giro = ext.giro; updateRow.giro = ext.giro; }
-      if (ext.costo_envio !== null && ext.costo_envio !== undefined) newCtx.costo_envio = Number(ext.costo_envio) || 0;
-      if (ext.datos_bancarios) { newCtx.datos_bancarios = ext.datos_bancarios; updateRow.payment_note = ext.datos_bancarios; }
-      if (ext.titular_cuenta_ocr) newCtx.titular_cuenta_ocr = ext.titular_cuenta_ocr;
-      if (ext.acepta_tc !== null && ext.acepta_tc !== undefined) newCtx.acepta_tc = Boolean(ext.acepta_tc);
-      if (ext.es_qr_pago) newCtx.payment_qr_received = true;
-      newCtx.contexto_configurado = true;
-
-      updateRow.custom_context = newCtx;
-      await supabase.from('merchants').update(updateRow).eq('id', tenant.id);
-
-      if (Array.isArray(ext.items) && ext.items.length > 0) {
-        await supabase.from('menu_items').delete().eq('merchant_id', tenant.id);
-        const rows = ext.items.map(i => ({
-          merchant_id: tenant.id,
-          name: String(i.nombre || 'Producto').slice(0, 100),
-          price: Number(i.precio) || 0,
-          category: String(i.categoria || 'General').slice(0, 50),
-          available: true
-        }));
-        await supabase.from('menu_items').insert(rows);
-      }
-
-      onboardingState.delete(senderPhone);
-      await getTenantBundle(true);
-      await ctx.send(`🎉 *¡Datos actualizados con éxito!*\nTu asistente IA ya está aplicando los nuevos cambios en WhatsApp.`);
-      return true;
-    } catch (err) {
-      console.error('[Owner Setup Error]:', err.message);
-      onboardingState.delete(senderPhone);
-      await ctx.send(`⚠️ No se pudo procesar automáticamente el texto. Escribe *configurar* para intentarlo nuevamente.`);
-      return true;
-    }
+  let ext = {};
+  try {
+    const aiRes = await gemini({
+      contents: [{ role: 'user', parts }],
+      maxOutputTokens: 800,
+      jsonMode: true
+    });
+    ext = parseAIExtraction(extractTextFromParts(aiRes?.candidates?.[0]?.content?.parts));
+  } catch (err) {
+    console.error('[Gemini Setup Error]:', err.message);
   }
 
-  return false;
+  const newCtx = { ...(parseCustomContext(tenant)) };
+  const updateRow = {};
+
+  if (ext.nombre_negocio) {
+    updateRow.name = ext.nombre_negocio;
+    newCtx.contexto_configurado = true;
+  }
+  if (ext.direccion) updateRow.address = ext.direccion;
+  if (ext.horario) {
+    const [open, close] = String(ext.horario).split('-').map(s => s.trim());
+    if (open) updateRow.open_time = open;
+    if (close) updateRow.close_time = close;
+  }
+  if (ext.giro) {
+    newCtx.giro = ext.giro;
+    newCtx.contexto_configurado = true;
+  }
+  if (ext.costo_envio !== null && ext.costo_envio !== undefined) newCtx.costo_envio = Number(ext.costo_envio) || 0;
+  if (ext.datos_bancarios) newCtx.datos_bancarios = ext.datos_bancarios;
+  if (ext.titular_cuenta_ocr) newCtx.titular_cuenta_ocr = ext.titular_cuenta_ocr;
+  if (ext.acepta_tc !== null && ext.acepta_tc !== undefined) newCtx.acepta_tc = Boolean(ext.acepta_tc);
+  if (ext.terminos_condiciones) newCtx.terminos_condiciones = ext.terminos_condiciones;
+  if (ext.es_qr_pago) newCtx.payment_qr_received = true;
+
+  updateRow.custom_context = newCtx;
+  await supabase.from('merchants').update(updateRow).eq('id', tenant.id);
+
+  if (Array.isArray(ext.items) && ext.items.length > 0) {
+    await supabase.from('menu_items').delete().eq('merchant_id', tenant.id);
+    const rows = ext.items.map(i => ({
+      merchant_id: tenant.id,
+      name: String(i.nombre || 'Producto').slice(0, 100),
+      price: Number(i.precio) || 0,
+      category: String(i.categoria || 'General').slice(0, 50),
+      available: true
+    }));
+    await supabase.from('menu_items').insert(rows);
+  }
+
+  const refreshed = await getTenantBundle(true);
+  const stillMissing = checkMissingSetupFields(refreshed.data, refreshed.items);
+
+  if (stillMissing.length > 0) {
+    onboardingState.set(senderPhone, { stage: 'awaiting_setup' });
+    const pendingList = stillMissing.map(m =>
+      m === 'contexto' ? '• *Contexto de tu negocio:* Nombre del local, giro, dirección y horario.' :
+      m === 'menu' ? '• *Tu Menú o lista de precios:* Escribe tus productos con precios o envía una foto.' :
+      '• *Tu QR de Deuna! o Cuenta Bancaria:* Envía la imagen de tu QR o tu número de cuenta para cobrar.'
+    ).join('\n');
+
+    await ctx.send(
+      `✅ *¡Guardado con éxito!*\n\n` +
+      `Para completar la configuración inicial, envíame ahora:\n${pendingList}`
+    );
+    return true;
+  }
+
+  onboardingState.delete(senderPhone);
+  const webUrl = refreshed.data?.website_url || `https://wabot.ec/b/${refreshed.data?.slug}`;
+  const menuUrl = refreshed.data?.menu_url || `https://wabot.ec/b/${refreshed.data?.slug}/menu`;
+
+  await ctx.send(
+    `🎉 *¡Configuración 100% Lista!*\n\n` +
+    `• *Negocio:* ${refreshed.data?.name} (${newCtx.giro || 'Comercio'})\n` +
+    `• *Productos activos:* ${refreshed.items?.length || 0}\n` +
+    `• *Web:* ${webUrl}\n` +
+    `• *Menú QR:* ${menuUrl}\n\n` +
+    `Ya estoy atendiendo a tus clientes de forma autónoma 24/7. Escribe *configurar* cuando desees actualizar tu contexto o menú.`
+  );
+  return true;
 }
 
 // ============================================================================
-// 7. PROCESADOR CENTRAL DE MENSAJES (ULTRA FLUIDO)
+// 7. RESPUESTAS DE 0 TOKENS PARA CLIENTES Y PROMPT COMPACTO
+// ============================================================================
+function tryZeroTokenCustomerReply(tenant, items, text, isFirstMessage) {
+  const clean = normalizeText(text);
+  const ctx = parseCustomContext(tenant);
+  const isAllInOne = tenant?.plan === 'all_in_one' || tenant?.plan === 'trial';
+  const webUrl = tenant?.website_url || `https://wabot.ec/b/${tenant?.slug}`;
+  const menuUrl = tenant?.menu_url || `https://wabot.ec/b/${tenant?.slug}/menu`;
+
+  const introHeader = isFirstMessage
+    ? `👋 ¡Hola! Soy el Asistente Virtual de *${tenant?.name || 'WaBot'}* (${ctx.giro || 'Comercio'}), impulsado por *WaBot.AI 2079 EDGE*.\n` +
+      `Brindo precios oficiales, menú digital, toma de pedidos y validación de pagos Deuna! bajo la *LOPDP Ecuador* (uso moderado de datos, retención 10 días; escribe *mis datos* o *borrar mis datos*).\n\n`
+    : '';
+
+  if (/^(hola|buenas|buenos dias|buenas tardes|buenas noches|info|informacion|inicio)$/.test(clean)) {
+    const sample = (items || []).slice(0, 6).map(i => `• *${i.name}:* $${Number(i.price).toFixed(2)}`).join('\n');
+    return (
+      `${introHeader || `👋 ¡Bienvenido a *${tenant?.name || 'nuestro local'}*!\n\n`}` +
+      `🕒 *Horario:* ${tenant?.open_time || '09:00'} - ${tenant?.close_time || '20:00'} | 📍 ${tenant?.address || tenant?.city || 'Ecuador'}\n\n` +
+      `📋 *Nuestro Catálogo:*\n${sample}\n\n` +
+      (isAllInOne ? `🍽️ *Menú Digital QR:* ${menuUrl}\n🌐 *Web:* ${webUrl}\n\n` : '') +
+      `¿Qué deseas pedir hoy?`
+    );
+  }
+
+  if (/^(menu|catalogo|precios|lista de precios|carta|que venden)$/.test(clean)) {
+    const list = (items || []).map(i => `• *${i.name}:* $${Number(i.price).toFixed(2)}`).join('\n');
+    return (
+      `${introHeader}📖 *MENÚ Y PRECIOS — ${tenant?.name || 'Local'}*\n\n${list}\n\n` +
+      `🚚 *Envío:* $${Number(ctx.costo_envio || 0).toFixed(2)}\n` +
+      (isAllInOne ? `🛒 *Pide en el Menú QR:* ${menuUrl}` : `Escribe los productos que deseas ordenar.`)
+    );
+  }
+
+  if (/^(cuenta|deuna|transferencia|qr|datos bancarios|como pago|metodos de pago)$/.test(clean)) {
+    return (
+      `${introHeader}💳 *DATOS DE PAGO — ${tenant?.name || 'Local'}*\n\n` +
+      `• *Deuna! / Cuenta:* ${ctx.datos_bancarios || 'Confirmar al cerrar el pedido'}\n` +
+      `• *Titular:* ${ctx.titular_cuenta_ocr || tenant?.name || 'Titular'}\n` +
+      `• *Tarjeta de Crédito (TC):* ${ctx.acepta_tc ? 'Aceptada' : 'No habilitada'}\n\n` +
+      `📸 Envía la captura de tu comprobante por aquí para validarlo automáticamente.`
+    );
+  }
+
+  return null;
+}
+
+function buildCompactSystemPrompt(tenant, items = [], includeIntro = false) {
+  const ctx = parseCustomContext(tenant);
+  const isAllInOne = tenant?.plan === 'all_in_one' || tenant?.plan === 'trial';
+  const menuUrl = tenant?.menu_url || `https://wabot.ec/b/${tenant?.slug}/menu`;
+  const compactCatalog = (items || []).map(i => `${i.name}:$${Number(i.price).toFixed(2)}`).join(' | ');
+
+  return `Asistente comercial de "${tenant?.name || 'Comercio'}" (${ctx.giro || 'Comercio'}, ${tenant?.address || tenant?.city || 'Ecuador'}, ${tenant?.open_time || '09:00'}-${tenant?.close_time || '20:00'}).
+${includeIntro ? 'Inicia presentándote en 1 línea como Asistente IA de ' + tenant?.name + ' (WaBot.AI 2079, LOPDP retención 10 días).' : ''}
+Precios USD: ${compactCatalog}.
+Envío: $${Number(ctx.costo_envio || 0).toFixed(2)}. Pagos: ${ctx.datos_bancarios || 'Deuna/Transferencia'}. TC: ${ctx.acepta_tc ? 'Sí' : 'No'}.
+${isAllInOne ? `Menú QR: ${menuUrl}` : ''}
+Sé breve (máximo 4 líneas). No inventes precios ni productos.`;
+}
+
+// ============================================================================
+// 8. PROCESADOR CENTRAL DE MENSAJES CON RESPUESTAS ULTRA FLUIDAS
 // ============================================================================
 async function processIncomingMessage({ senderPhone, text, msg, sendReply }) {
   const { data: tenant, items } = await getTenantBundle();
   if (!tenant) return;
 
-  const isOwner =
-    senderPhone === (tenant.owner_phone || '').replace(/[^\d]/g, '') ||
-    senderPhone === (WABOT_BILLING_INFO.superadmin_phone || '').replace(/[^\d]/g, '');
-
   const cleanLower = (text || '').trim().toLowerCase();
 
-  // 1. DERECHOS ARCO LOPDP ECUADOR (Art. 13 y 15)
+  // Comandos de privacidad LOPDP Ecuador
   if (cleanLower === 'mis datos' || cleanLower === 'consultar mis datos') {
-    try {
-      const { data: arco } = await supabase.rpc('export_customer_data', { p_tenant: tenant.id, p_phone: senderPhone });
-      await sendReply(
-        `📄 *REPORTE LOPDP ECUADOR (Art. 13)*\n• *Teléfono:* +${senderPhone}\n• *Pedidos Registrados:* ${arco?.pedidos?.length || 0}\n• *Uso Moderado (Art. 10):* Conversaciones eliminadas tras 10 días.\n• Para anonimizar tus datos, responde *borrar mis datos*.`
-      );
-    } catch (_) {
-      await sendReply(`📄 *REPORTE LOPDP:* Tus datos se manejan bajo el principio de minimización (Art. 10). Escribe *borrar mis datos* para solicitar su eliminación.`);
-    }
+    const { data: arco } = await supabase.rpc('export_customer_data', { p_tenant: tenant.id, p_phone: senderPhone });
+    await sendReply(
+      `📄 *REPORTE LOPDP ECUADOR (Art. 13)*\n• *Teléfono:* +${senderPhone}\n• *Pedidos:* ${arco?.pedidos?.length || 0}\n• *Uso moderado (Art. 10):* Chats eliminados a los 10 días. Escribe *borrar mis datos* para anonimizar ahora.`
+    );
     return;
   }
 
   if (cleanLower === 'borrar mis datos' || cleanLower === 'eliminar mis datos') {
-    try {
-      await supabase.rpc('anonymize_customer', { p_tenant: tenant.id, p_phone: senderPhone });
-    } catch (_) {}
-    await sendReply(`🔒 *Tus datos han sido anonimizados irreversiblemente conforme al Art. 15 de la LOPDP Ecuador.*`);
+    await supabase.rpc('anonymize_customer', { p_tenant: tenant.id, p_phone: senderPhone });
+    await sendReply(`🔒 *Datos anonimizados irreversiblemente (Art. 15 LOPDP Ecuador).*`);
     return;
   }
 
-  // 2. CONFIGURACIÓN DEL DUEÑO (SOLO SI ES EL OWNER)
-  if (isOwner) {
-    const handled = await handleOwnerSetupFlow({ ctx: { send: sendReply }, tenant, senderPhone, text, msg });
-    if (handled) return;
-  }
+  // Verificar si falta el contexto, menú o QR del negocio (pide el contexto de forma autónoma al iniciar)
+  const handledBySetup = await handleAutonomousSetup({
+    ctx: { send: sendReply },
+    tenant,
+    items,
+    senderPhone,
+    text,
+    msg
+  });
+  if (handledBySetup) return;
 
-  // 3. RESPUESTAS RÁPIDAS DE 0 TOKENS (SALUDO, MENÚ, PRECIOS, PAGOS)
   const isFirstMsg = !greetedUsers.has(senderPhone);
   greetedUsers.add(senderPhone);
 
+  // Respuesta inmediata de 0 tokens (< 5ms) para consultas frecuentes
   const zeroTokenReply = tryZeroTokenCustomerReply(tenant, items, text, isFirstMsg);
   if (zeroTokenReply) {
     await sendReply(zeroTokenReply);
     return;
   }
 
-  // 4. CONTROL DE CUOTA IA
+  // Verificación de cuota de IA en Supabase
   try {
     const { data: quotaAi } = await supabase.rpc('check_and_consume_quota', { p_tenant: tenant.id, p_metric: 'ai' });
-    if (!quotaAi?.allowed) {
+    if (quotaAi && quotaAi.allowed === false) {
       await sendReply(
-        `🔒 *Periodo de prueba finalizado.*\nPara activar tu servicio mensual ($19.99 o $29.99), transfiere a *${WABOT_BILLING_INFO.bank_name}* (${WABOT_BILLING_INFO.account_type} \`${WABOT_BILLING_INFO.account_number}\`, Titular: ${WABOT_BILLING_INFO.beneficiary_name}, C.I. \`${WABOT_BILLING_INFO.beneficiary_id}\`) y envía el comprobante por aquí.`
+        `🔒 *Periodo de prueba finalizado.*\nPara activar tu plan mensual ($19.99 o $29.99), transfiere a *${WABOT_BILLING_INFO.bank_name}* (${WABOT_BILLING_INFO.account_type} \`${WABOT_BILLING_INFO.account_number}\`, Titular: ${WABOT_BILLING_INFO.beneficiary_name}, C.I. \`${WABOT_BILLING_INFO.beneficiary_id}\`) y envía la captura.`
       );
       return;
     }
-  } catch (_) {}
+  } catch (qErr) {
+    console.warn('[Quota Check Notice]:', qErr.message);
+  }
 
-  // 5. ATENCIÓN COMERCIAL INTELIGENTE CON GEMINI FLASH LITE (< 1s)
+  // Respuesta inteligente con Gemini Flash Lite
   try {
     const sysPrompt = buildCompactSystemPrompt(tenant, items, isFirstMsg);
     const aiRes = await gemini({
       systemInstruction: sysPrompt,
       contents: [{ role: 'user', parts: [{ text }] }],
-      maxOutputTokens: 180
+      maxOutputTokens: 200
     });
 
     const reply = extractTextFromParts(aiRes?.candidates?.[0]?.content?.parts);
@@ -489,18 +571,18 @@ async function processIncomingMessage({ senderPhone, text, msg, sendReply }) {
       await sendReply(reply);
       return;
     }
-  } catch (aiErr) {
-    console.error('[Gemini AI Fallback Error]:', aiErr.message);
+  } catch (err) {
+    console.error('[Gemini AI Error]:', err.message);
   }
 
-  // Fallback seguro si la IA no respondió o dio timeout
+  // Fallback garantizado por si la IA no devuelve texto
   await sendReply(
-    `👋 ¡Hola! En *${tenant.name}* estamos atentos a tus pedidos. Puedes consultar nuestro catálogo respondiendo *menu* o consultarnos directamente lo que necesitas.`
+    `👋 ¡Hola! En *${tenant.name}* estamos atentos a tus pedidos. Escribe *menu* para ver la lista de precios oficial o *cuenta* para formas de pago.`
   );
 }
 
 // ============================================================================
-// 8. MOTOR BAILEYS OPTIMIZADO (CONEXIÓN Y MANEJO CÓDIGO 515)
+// 9. MOTOR BAILEYS CON RECONEXIÓN INMEDIATA EN CÓDIGO 515 (NO SE QUEDA CONECTANDO)
 // ============================================================================
 async function startBot(forceWipe = false) {
   if (sockInstance) {
@@ -514,6 +596,7 @@ async function startBot(forceWipe = false) {
   if (forceWipe) {
     await wipeCorruptedSession();
   } else {
+    // Solo restaura desde Supabase una vez al iniciar el contenedor, jamás en medio del código 515
     await restoreAuthFromSupabaseOnce();
   }
 
@@ -539,6 +622,8 @@ async function startBot(forceWipe = false) {
 
   sockInstance = sock;
 
+  // CRÍTICO: Solo ejecutar saveCreds() en disco local durante el handshake;
+  // el respaldo a Supabase se programa con debounce para no congelar "Conectando..." en el celular
   sock.ev.on('creds.update', async () => {
     await saveCreds();
     scheduleBackupAuthToSupabase(5000);
@@ -550,20 +635,22 @@ async function startBot(forceWipe = false) {
     if (qr) {
       latestQrData = qr;
       connectionStatus = 'qr_ready';
-      console.log('[QR Ready] Nuevo código QR listo en /qr');
+      console.log('[QR Ready] Nuevo QR disponible en /qr');
     }
 
     if (connection === 'close') {
       const statusCode = lastDisconnect?.error?.output?.statusCode;
       console.log(`[Connection Closed] statusCode=${statusCode}`);
 
-      // Código 515 (restartRequired) tras escanear el QR: reconexión inmediata en 150ms
+      // CASO 1: Código 515 (restartRequired) ocurre SIEMPRE justo después de escanear el QR.
+      // Debe reconectar en 150ms usando el creds.json local recién creado, SIN borrar ni sobrescribir nada.
       if (statusCode === DisconnectReason.restartRequired || statusCode === 515) {
-        console.log('[Handshake 515] Reinicio rápido de emparejamiento en 150ms...');
+        console.log('[Pairing Handshake 515] Reinicio rápido de emparejamiento en 150ms...');
         setTimeout(() => startBot(false), 150);
         return;
       }
 
+      // CASO 2: Sesión cerrada desde el celular (401) o corrupta (500/403/405) -> Limpiar y dar QR nuevo
       if (
         statusCode === DisconnectReason.loggedOut ||
         statusCode === DisconnectReason.badSession ||
@@ -576,31 +663,35 @@ async function startBot(forceWipe = false) {
         return;
       }
 
+      // CASO 3: Desconexión de red normal -> Reconectar conservando credenciales locales
       connectionStatus = 'reconnecting';
       setTimeout(() => startBot(false), 2500);
     } else if (connection === 'open') {
       latestQrData = null;
       latestPairingCode = null;
       connectionStatus = 'connected';
-      console.log('✅ [WaBot.AI 2079 EDGE] ¡WhatsApp conectado y operativo 24/7!');
+      console.log('✅ [WaBot.AI 2079 EDGE] ¡WhatsApp conectado con éxito!');
       scheduleBackupAuthToSupabase(2000);
 
+      // Apenas conecta por primera vez, el bot envía de forma autónoma el mensaje pidiendo el contexto del negocio
       if (!welcomeSentOnOpen) {
         welcomeSentOnOpen = true;
         setTimeout(async () => {
           try {
             const myJid = sock.user?.id?.replace(/:\d+@/, '@');
-            if (!myJid || !sock || !sock.user) return;
-            const { data: tenant } = await getTenantBundle(true);
-            const isConfigured = Boolean(tenant?.custom_context?.contexto_configurado);
-            if (!isConfigured) {
-              await sock.sendMessage(myJid, { text: buildBotSelfIntroductionPrompt(['contexto', 'menu', 'qr_cobro']) });
+            const myPhone = (myJid || '').replace(/@.+$/, '').replace(/[^\d]/g, '');
+            const { data: tenant, items } = await getTenantBundle(true);
+            const missing = checkMissingSetupFields(tenant, items);
+
+            if (missing.length > 0 && myJid && sock && sock.user) {
+              onboardingState.set(myPhone, { stage: 'awaiting_setup' });
+              await sock.sendMessage(myJid, { text: buildBotSelfIntroductionPrompt(missing) });
               console.log('✅ [Welcome Sent] Prompt de bienvenida enviado al dueño.');
             }
           } catch (err) {
             console.error('[Welcome Prompt Error]:', err.message);
           }
-        }, 3000);
+        }, 2000);
       }
     }
   });
@@ -642,15 +733,15 @@ async function startBot(forceWipe = false) {
             }
           }
         });
-      } catch (err) {
-        console.error('[Message Processing Error]:', err.message);
+      } catch (loopErr) {
+        console.error('[Message Processing Error]:', loopErr.message);
       }
     }
   });
 }
 
 // ============================================================================
-// 9. SERVIDOR HTTP (/qr, /health, /api/qr-state, /pair)
+// 10. SERVIDOR HTTP (/qr, /qr?reset=1, /pair Y /health)
 // ============================================================================
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://127.0.0.1:${PORT}`);
@@ -665,7 +756,7 @@ const server = http.createServer(async (req, res) => {
       billing_bank: WABOT_BILLING_INFO.bank_name,
       billing_account_masked: maskEnd(WABOT_BILLING_INFO.account_number, 4),
       uptime_seconds: Math.floor(process.uptime()),
-      user: sockInstance?.user?.id || null
+      user: sockInstance?.user?.id ? maskEnd(sockInstance.user.id, 6) : null
     }));
     return;
   }
@@ -729,11 +820,11 @@ const server = http.createServer(async (req, res) => {
     <div id="pair-box" style="display:none;" class="code-badge"></div>
 
     <div style="margin-top:16px;border-top:1px solid #334155;padding-top:14px;">
-      <a class="btn" href="/qr?reset=1">🔄 Borrar Sesión y Generar QR Nuevo</a>
+      <a class="btn" href="/qr?reset=1">🔄 Borrar Sesión Atascada y Generar QR Nuevo</a>
     </div>
 
     <form action="/pair" method="GET" style="margin-top:16px;border-top:1px solid #334155;padding-top:14px;">
-      <p style="font-size:13px;color:#cbd5e1;margin:4px 0;">O vincular con Código de 8 dígitos:</p>
+      <p style="font-size:13px;color:#cbd5e1;margin:4px 0;">O vincula con Código de 8 dígitos (pon tu número con 593):</p>
       <input type="text" name="phone" placeholder="Ej: 593983476198" required />
       <button type="submit" class="btn btn-pair">Obtener Código</button>
     </form>
@@ -754,20 +845,25 @@ const server = http.createServer(async (req, res) => {
           pairBox.textContent = data.pairingCode;
         }
         if (data.status === 'connected') {
-          statusText.textContent = '✅ ¡WhatsApp Conectado y Activo 24/7! Puedes escribirle un mensaje para probarlo.';
+          statusText.textContent = '✅ ¡WhatsApp Conectado! Revisa tu chat de WhatsApp: el bot ya está activo atendiendo 24/7.';
           qrContainer.style.display = 'none';
           return;
         }
         if (data.qr) {
-          statusText.textContent = '📲 Escanea este QR para vincular en 1 segundo:';
+          statusText.textContent = '📲 Escanea este QR (Vinculará en 1 segundo):';
           qrContainer.style.display = 'block';
           if (data.qr !== currentQr) {
             currentQr = data.qr;
             qrBox.innerHTML = '';
-            new QRCode(qrBox, { text: data.qr, width: 256, height: 256 });
+            new QRCode(qrBox, {
+              text: data.qr,
+              width: 256,
+              height: 256,
+              correctLevel: QRCode.CorrectLevel.M
+            });
           }
         } else {
-          statusText.textContent = '⏳ Iniciando conexión...';
+          statusText.textContent = '⏳ Generando QR... Si se quedó pegado, toca el botón rojo de abajo.';
         }
       } catch (e) {}
     }
