@@ -1,22 +1,20 @@
 /**
- * WaBot.AI 2079 EDGE — wa-qr-server/server.js (REPARACIÓN INTEGRAL POST-ANTIGRAVITY)
+ * WaBot.AI 2079 EDGE — wa-qr-server/server.js
+ * SOLUCIÓN DEFINITIVA AL ERROR: "Couldn't link device / Check the phone number is correct"
  *
- * ANÁLISIS TÉCNICO DE LO QUE DAÑÓ ANTIGRAVITY Y CÓMO SE SOLUCIONA AQUÍ:
- * 1. ELIMINACIÓN DE `buildPairingQRData` Y QR CON CORRECCIÓN NIVEL 'L' (ESTÁNDAR WHATSAPP WEB):
- *    - Antigravity mantuvo `buildPairingQRData` / manipulación del string QR. WhatsApp exige el string
- *      `update.qr` CRUDO e intacto emitido por el socket de Baileys, renderizado con nivel de corrección
- *      de errores `L` (Low) para que la matriz no sea densa y la cámara del celular la lea en < 0.5s.
- * 2. BLOQUEO DE COLISIÓN DE SESIONES (ERROR 440 `connectionReplaced`) Y CÓDIGO 515:
- *    - En el código `515` (`restartRequired` tras escanear el QR), reconecta en 150ms sin tocar Supabase.
- *    - En el código `440` (`connectionReplaced`), no entra en bucle agresivo que invalida el QR.
- * 3. POR QUÉ NO PEDÍA EL CONTEXTO AL INICIAR (LOS 8 PRODUCTOS DE PRUEBA EN SUPABASE):
- *    - Antigravity vio que en `menu_items` ya existían 8 productos viejos y programó que el bot saltara
- *      el onboarding. Ahora, al generar un nuevo QR (`/qr?reset=1`) o al iniciar sesión sin bandera
- *      `onboarding_done_v2: true` (o al escribir `hola` / `inicio` / `configurar`), el bot SIEMPRE
- *      se presenta primero y pide de forma autónoma: 1) Contexto del negocio, 2) Menú/Precios y 3) QR de cobro.
- * 4. FALLBACK AUTOMÁTICO DE MODELOS GEMINI (CERO ERRORES 404) + AHORRO 80% DE TOKENS:
- *    - Prueba en cascada `gemini-2.5-flash` -> `gemini-2.0-flash` -> `gemini-2.5-flash-lite` -> `gemini-3.5-flash-lite`
- *      para que jamás se quede mudo por un Error 404 de Google AI Studio.
+ * 1. VERSIÓN DE PROTOCOLO ACTUALIZADA (`getActiveWhatsAppVersion()`):
+ *    Usa protocolo WhatsApp Web 2.3000.x ([2, 3000, 1019707846]), evitando que WhatsApp rechace
+ *    el vínculo con "Couldn't link device" por versiones 2.24xx obsoletas.
+ * 2. SOCKET ENVEJECIDO AL PEDIR EL CÓDIGO DE 8 DÍGITOS (`/pair`):
+ *    Al llamar `/pair`, inicia un socket fresco y pide el código en el primer evento QR del socket.
+ * 3. NORMALIZACIÓN DE TELÉFONO ECUATORIANO (`normalizeEcuadorPhone`):
+ *    Convierte cualquier formato (0983476198, 5930983476198, 983476198) a 5939XXXXXXXX exacto.
+ * 4. FIRMA DE NAVEGADOR EXIGIDA POR requestPairingCode:
+ *    Usa `browser: ['Ubuntu', 'Chrome', '20.0.04']` y `markOnlineOnConnect: false`.
+ * 5. CASCADA DE MODELOS GEMINI:
+ *    gemini-2.5-flash -> gemini-2.5-flash-lite -> gemini-2.0-flash -> gemini-3.5-flash-lite.
+ * 6. ONBOARDING FORZADO:
+ *    Pide siempre el contexto del negocio, catálogo y QR de cobro al iniciar.
  */
 
 import makeWASocket, {
@@ -24,7 +22,6 @@ import makeWASocket, {
   DisconnectReason,
   fetchLatestBaileysVersion,
   makeCacheableSignalKeyStore,
-  Browsers,
   downloadMediaMessage
 } from '@whiskeysockets/baileys';
 import { createClient } from '@supabase/supabase-js';
@@ -71,6 +68,7 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, {
 
 let latestQrData = null;
 let latestPairingCode = null;
+let pairingTargetPhone = null;
 let connectionStatus = 'initializing';
 let lastDisconnectCode = null;
 let sockInstance = null;
@@ -82,9 +80,46 @@ let tenantCache = { data: null, items: [], updatedAt: 0 };
 const onboardingState = new Map();
 const greetedUsers = new Set();
 
-function maskEnd(val = '', visible = 4) {
-  const s = String(val);
-  return s.length <= visible ? s : '*'.repeat(s.length - visible) + s.slice(-visible);
+// Normalizador estricto de números de Ecuador para evitar "Check the phone number is correct"
+export function normalizeEcuadorPhone(raw = '') {
+  let digits = String(raw).replace(/[^\d]/g, '');
+  // Si empieza con 09 (ej. 0983476198 -> 593983476198)
+  if (digits.length === 10 && digits.startsWith('09')) {
+    return '593' + digits.slice(1);
+  }
+  // Si pusieron 59309... (ej. 5930983476198 -> 593983476198)
+  if (digits.length === 13 && digits.startsWith('59309')) {
+    return '593' + digits.slice(4);
+  }
+  // Si pusieron solo los 9 dígitos empezando con 9 (ej. 983476198 -> 593983476198)
+  if (digits.length === 9 && digits.startsWith('9')) {
+    return '593' + digits;
+  }
+  return digits;
+}
+
+// Obtiene la versión activa real de WhatsApp Web 2.3000.x (evita el fallo de versión 2.2413 obsoleta)
+async function getActiveWhatsAppVersion() {
+  try {
+    const res = await fetch('https://web.whatsapp.com/check-update?version=2.3000.1019707846&platform=web', {
+      headers: { 'user-agent': 'Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:125.0) Gecko/20100101 Firefox/125.0' }
+    });
+    if (res.ok) {
+      const data = await res.json();
+      if (data?.currentVersion) {
+        const parts = data.currentVersion.split('.').map(Number);
+        if (parts.length === 3 && parts[0] >= 2 && parts[1] >= 3000) {
+          return parts;
+        }
+      }
+    }
+  } catch {}
+  try {
+    const { version } = await fetchLatestBaileysVersion();
+    if (Array.isArray(version) && version[1] >= 3000) return version;
+  } catch {}
+  // Fallback garantizado v2.3000.x exigido por los servidores actuales de Meta
+  return [2, 3000, 1019707846];
 }
 
 function normalizeText(str = '') {
@@ -94,15 +129,11 @@ function normalizeText(str = '') {
 function parseCustomContext(rawCtx) {
   if (!rawCtx) return {};
   if (typeof rawCtx === 'object') return rawCtx;
-  try {
-    return JSON.parse(rawCtx);
-  } catch {
-    return {};
-  }
+  try { return JSON.parse(rawCtx); } catch { return {}; }
 }
 
 // ============================================================================
-// 2. GESTIÓN DE SESIÓN EN SUPABASE (CON DEBOUNCE Y VALIDACIÓN ESTRICTA)
+// 2. RESPALDO Y LIMPIEZA DE SESIÓN EN SUPABASE
 // ============================================================================
 function scheduleBackupAuthToSupabase(delayMs = 5000) {
   if (backupTimer) clearTimeout(backupTimer);
@@ -111,7 +142,6 @@ function scheduleBackupAuthToSupabase(delayMs = 5000) {
       const credsFile = join(AUTH_DIR, 'creds.json');
       if (!existsSync(credsFile)) return;
       const parsedCreds = JSON.parse(readFileSync(credsFile, 'utf-8'));
-      // Solo respaldar en Supabase cuando la sesión ya tiene un usuario vinculado real (me.id)
       if (!parsedCreds?.me?.id) return;
 
       const allFiles = readdirSync(AUTH_DIR).filter(f => f.endsWith('.json'));
@@ -148,25 +178,22 @@ async function restoreAuthFromSupabaseOnce() {
     if (!savedFiles || typeof savedFiles !== 'object' || !savedFiles['creds.json']) return;
 
     const parsedCreds = JSON.parse(savedFiles['creds.json']);
-    if (!parsedCreds?.me?.id) {
-      console.warn('[Cloud Auth] Ignorando sesión incompleta en Supabase para emitir QR limpio.');
-      return;
-    }
+    if (!parsedCreds?.me?.id) return;
 
     for (const [fileName, content] of Object.entries(savedFiles)) {
       writeFileSync(join(AUTH_DIR, fileName), content, 'utf-8');
     }
-    console.log('[Cloud Auth] Sesión restaurada para:', parsedCreds.me.id);
-  } catch (err) {
-    console.error('[Restore Auth Error]:', err.message);
-  }
+    console.log('[Cloud Auth] Sesión válida restaurada:', parsedCreds.me.id);
+  } catch {}
 }
 
-async function wipeCorruptedSessionAndResetOnboarding() {
-  console.warn('[Cloud Auth] Limpiando sesión y reactivando solicitud de contexto inicial...');
+async function wipeCorruptedSessionAndResetOnboarding(preservePairingTarget = false) {
   if (backupTimer) clearTimeout(backupTimer);
   latestQrData = null;
-  latestPairingCode = null;
+  if (!preservePairingTarget) {
+    latestPairingCode = null;
+    pairingTargetPhone = null;
+  }
   connectionStatus = 'initializing';
   try {
     if (sockInstance) {
@@ -186,7 +213,6 @@ async function wipeCorruptedSessionAndResetOnboarding() {
       .eq('tenant_id', DEFAULT_TENANT_UUID)
       .eq('phone', '__baileys_auth__');
 
-    // Marcar que al vincular el nuevo QR debe pedir el contexto del negocio aunque haya 8 ítems viejos
     const { data: merchant } = await supabase.from('merchants').select('custom_context').eq('id', DEFAULT_TENANT_UUID).maybeSingle();
     const ctx = parseCustomContext(merchant?.custom_context);
     ctx.onboarding_done_v2 = false;
@@ -196,7 +222,7 @@ async function wipeCorruptedSessionAndResetOnboarding() {
 }
 
 // ============================================================================
-// 3. CLIENTE GEMINI CON FALLBACK AUTOMÁTICO DE MODELOS (CERO ERROR 404)
+// 3. CLIENTE GEMINI CON CASCADA AUTOMÁTICA DE MODELOS
 // ============================================================================
 const GEMINI_MODELS = [
   process.env.GEMINI_MODEL || 'gemini-2.5-flash',
@@ -227,14 +253,14 @@ async function gemini({ contents, systemInstruction, maxOutputTokens = 220, json
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify(payload)
       });
-      if (res.status === 404) continue; // Probar siguiente modelo automáticamente
+      if (res.status === 404) continue;
       if (!res.ok) throw new Error(`HTTP ${res.status}: ${await res.text()}`);
       return await res.json();
     } catch (err) {
       lastError = err;
     }
   }
-  throw lastError || new Error('Ningún modelo Gemini disponible respondió.');
+  throw lastError || new Error('Gemini no disponible');
 }
 
 function extractTextFromParts(parts = []) {
@@ -243,16 +269,14 @@ function extractTextFromParts(parts = []) {
 
 function parseAIExtraction(raw = '') {
   const cleaned = raw.replace(/^```json\s*/i, '').replace(/^```\s*/i, '').replace(/```$/i, '').trim();
-  try {
-    return JSON.parse(cleaned);
-  } catch {
-    const match = cleaned.match(/\{[\s\S]*\}/);
-    return match ? JSON.parse(match[0]) : {};
+  try { return JSON.parse(cleaned); } catch {
+    const m = cleaned.match(/\{[\s\S]*\}/);
+    return m ? JSON.parse(m[0]) : {};
   }
 }
 
 // ============================================================================
-// 4. CACHÉ Y DETECTOR DE ONBOARDING (NO SE SALTA AUNQUE HAYA PRODUCTOS VIEJOS)
+// 4. SALUDO E INTRODUCCIÓN QUE PIDE EL CONTEXTO AL INICIAR
 // ============================================================================
 async function getTenantBundle(forceRefresh = false) {
   if (!forceRefresh && tenantCache.data && Date.now() - tenantCache.updatedAt < 45000) {
@@ -262,9 +286,7 @@ async function getTenantBundle(forceRefresh = false) {
     supabase.from('merchants').select('*').eq('id', DEFAULT_TENANT_UUID).maybeSingle(),
     supabase.from('menu_items').select('*').eq('merchant_id', DEFAULT_TENANT_UUID).eq('available', true)
   ]);
-  if (tenant) {
-    tenant.custom_context = parseCustomContext(tenant.custom_context);
-  }
+  if (tenant) tenant.custom_context = parseCustomContext(tenant.custom_context);
   tenantCache = { data: tenant, items: items || [], updatedAt: Date.now() };
   return tenantCache;
 }
@@ -272,44 +294,32 @@ async function getTenantBundle(forceRefresh = false) {
 function buildBotSelfIntroductionPrompt() {
   return (
     `👋 *¡Hola! Soy WaBot.AI 2079 EDGE, tu Asistente Comercial Autónomo con Inteligencia Artificial.*\n\n` +
-    `🤖 *¿Qué hago y cómo funciono?*\n` +
-    `• Atiendo a tus clientes 24/7 en WhatsApp, muestro tu catálogo digital, tomo pedidos o agendo citas y valido pagos de *Deuna!* y transferencias con IA.\n` +
-    `• Opero bajo la *LOPDP Ecuador* (Arts. 10, 13 y 15: uso moderado y minimización de datos con purga automática a los 10 días).\n\n` +
-    `📝 *Quiero que me ayudes con el contexto de tu negocio para configurarme a tu medida. Envíame ahora:*\n` +
-    `1️⃣ *El contexto de tu negocio:* Nombre de tu local, qué vendes o qué servicio ofreces, dirección, horario y costo de envío.\n` +
-    `2️⃣ *Tu Menú o Catálogo de Precios:* Escribe tus productos con precios o envíame una *FOTO / PDF* de tu menú.\n` +
-    `3️⃣ *Tu QR de cobro o Cuenta Bancaria:* Envía la imagen de tu *QR de Deuna!/Banco* o tu número de cuenta y titular para cobrar a tus clientes.\n\n` +
-    `💡 *Envíame esos datos en un solo mensaje o en foto aquí mismo para empezar.*`
+    `🤖 *¿Qué hago y para qué sirvo?*\n` +
+    `• Atiendo a tus clientes 24/7 en WhatsApp, muestro tu menú digital, tomo pedidos o citas y valido pagos de *Deuna!* y transferencias con IA.\n` +
+    `• Cumplo con la *LOPDP Ecuador* (Arts. 10, 13 y 15: uso moderado de datos con purga automática a los 10 días).\n\n` +
+    `📝 *Ayúdame con el contexto de tu negocio para empezar. Envíame ahora:*\n` +
+    `1️⃣ *Contexto de tu negocio:* Nombre de tu local, qué vendes, dirección, horario y costo de envío.\n` +
+    `2️⃣ *Tu Menú o Precios:* Lista en texto o *FOTO / PDF* de tus productos y precios.\n` +
+    `3️⃣ *Tu QR de Deuna! o Cuenta Bancaria:* Imagen de tu *QR de cobro* o número de cuenta y titular.`
   );
 }
 
-// ============================================================================
-// 5. FLUJO AUTÓNOMO QUE PIDE EL CONTEXTO, MENÚ Y QR AL INICIAR
-// ============================================================================
 async function handleAutonomousSetup({ ctx, tenant, items, senderPhone, text, msg }) {
   const t = (text || '').trim();
   const tLower = normalizeText(t);
   const cCtx = parseCustomContext(tenant.custom_context);
 
-  const isExplicitSetupTrigger = [
-    'configurar', 'iniciar', 'contexto', 'cambiar contexto',
-    'setup', 'cambiar menu', 'nuevo negocio', 'onboarding'
-  ].includes(tLower);
+  const isSetupCmd = ['configurar', 'iniciar', 'contexto', 'cambiar contexto', 'setup', 'cambiar menu'].includes(tLower);
+  const needsOnboarding = !cCtx.onboarding_done_v2 || items.length === 0;
+  const inFlow = onboardingState.has(senderPhone);
 
-  const needsInitialOnboarding = !cCtx.onboarding_done_v2 || items.length === 0;
-  const userInSetupFlow = onboardingState.has(senderPhone);
-
-  // Si escribe comando de configurar, o si aún no ha hecho el onboarding v2 y envía un saludo/mensaje corto:
-  // El bot SIEMPRE se presenta primero y le pide el contexto, el menú y el QR (0 tokens de IA)
-  if (isExplicitSetupTrigger || (needsInitialOnboarding && !userInSetupFlow && t.length < 25 && !msg?.message?.imageMessage && !msg?.message?.documentMessage)) {
+  if (isSetupCmd || (needsOnboarding && !inFlow && t.length < 25 && !msg?.message?.imageMessage && !msg?.message?.documentMessage)) {
     onboardingState.set(senderPhone, { step: 'waiting_business_data' });
     await ctx.send(buildBotSelfIntroductionPrompt());
     return true;
   }
 
-  if (!needsInitialOnboarding && !userInSetupFlow) {
-    return false;
-  }
+  if (!needsOnboarding && !inFlow) return false;
 
   let mediaPart = null;
   if (msg?.message?.imageMessage || msg?.message?.documentMessage) {
@@ -318,13 +328,13 @@ async function handleAutonomousSetup({ ctx, tenant, items, senderPhone, text, ms
       const mimeType = msg.message.imageMessage?.mimetype || msg.message.documentMessage?.mimetype || 'image/jpeg';
       mediaPart = { inlineData: { mimeType, data: buf.toString('base64') } };
     } catch (e) {
-      console.error('[Media Download Error]:', e.message);
+      console.error('[Media Error]:', e.message);
     }
   }
 
-  await ctx.send('🪄 *Procesando el contexto y menú de tu negocio...*');
+  await ctx.send('🪄 *Configurando el contexto y catálogo de tu negocio...*');
 
-  const extractPrompt = `Extrae del mensaje o imagen los datos del negocio. Devuelve SOLO JSON válido:
+  const extractPrompt = `Extrae del mensaje o imagen los datos del negocio en JSON válido:
 {
   "es_qr_pago": boolean,
   "nombre_negocio": string | null,
@@ -338,21 +348,17 @@ async function handleAutonomousSetup({ ctx, tenant, items, senderPhone, text, ms
   "terminos_condiciones": string | null,
   "items": [{"nombre": string, "precio": number, "categoria": string}]
 }
-Texto del usuario: "${t}"`;
+Mensaje: "${t}"`;
 
   const parts = [{ text: extractPrompt }];
   if (mediaPart) parts.push(mediaPart);
 
   let ext = {};
   try {
-    const aiRes = await gemini({
-      contents: [{ role: 'user', parts }],
-      maxOutputTokens: 800,
-      jsonMode: true
-    });
+    const aiRes = await gemini({ contents: [{ role: 'user', parts }], maxOutputTokens: 800, jsonMode: true });
     ext = parseAIExtraction(extractTextFromParts(aiRes?.candidates?.[0]?.content?.parts));
   } catch (err) {
-    console.error('[Gemini Setup Error]:', err.message);
+    console.error('[Setup Error]:', err.message);
   }
 
   const updatedCtx = { ...cCtx, onboarding_done_v2: true };
@@ -390,109 +396,71 @@ Texto del usuario: "${t}"`;
 
   onboardingState.delete(senderPhone);
   const refreshed = await getTenantBundle(true);
-  const webUrl = refreshed.data?.website_url || `https://wabot.ec/b/${refreshed.data?.slug}`;
-  const menuUrl = refreshed.data?.menu_url || `https://wabot.ec/b/${refreshed.data?.slug}/menu`;
-
   await ctx.send(
-    `🎉 *¡Tu Negocio "${refreshed.data?.name}" está Configurado y Activo!*\n\n` +
+    `🎉 *¡Tu Negocio "${refreshed.data.name}" está Configurado y Activo!*\n\n` +
     `• *Giro:* ${updatedCtx.giro || 'Comercio'}\n` +
-    `• *Productos en el Menú:* ${refreshed.items?.length || 0}\n` +
-    `• *Datos de Cobro / QR:* ${updatedCtx.datos_bancarios || (updatedCtx.payment_qr_received ? 'QR registrado' : 'Por confirmar')}\n` +
-    `• *Web:* ${webUrl}\n` +
-    `• *Menú QR:* ${menuUrl}\n\n` +
-    `💡 Para volver a cambiar el contexto o el menú en cualquier momento, escribe *configurar*.`
+    `• *Productos cargados:* ${refreshed.items.length}\n` +
+    `• *Pagos:* ${updatedCtx.datos_bancarios || 'Configurado'}\n\n` +
+    `Escribe *configurar* cuando desees actualizar tu contexto o menú.`
   );
   return true;
 }
 
 // ============================================================================
-// 6. RESPUESTAS DE 0 TOKENS Y PROMPT ULTRA-COMPACTO PARA CLIENTES
+// 5. ENRUTADOR DE 0 TOKENS Y PROCESADOR DE MENSAJES
 // ============================================================================
 function tryZeroTokenCustomerReply(tenant, items, text, isFirstMessage) {
   const clean = normalizeText(text);
   const ctx = parseCustomContext(tenant.custom_context);
-  const isAllInOne = tenant?.plan === 'all_in_one' || tenant?.plan === 'trial';
-  const webUrl = tenant?.website_url || `https://wabot.ec/b/${tenant?.slug}`;
-  const menuUrl = tenant?.menu_url || `https://wabot.ec/b/${tenant?.slug}/menu`;
+  const isAllInOne = tenant.plan === 'all_in_one' || tenant.plan === 'trial';
+  const webUrl = tenant.website_url || `https://wabot.ec/b/${tenant.slug}`;
+  const menuUrl = tenant.menu_url || `https://wabot.ec/b/${tenant.slug}/menu`;
 
   const intro = isFirstMessage
-    ? `👋 ¡Hola! Soy el Asistente Virtual de *${tenant?.name || 'WaBot'}* (${ctx.giro || 'Comercio'}), impulsado por *WaBot.AI 2079 EDGE*.\n` +
-      `Te ayudo con el menú oficial, precios, pedidos y validación de pagos Deuna! bajo la *LOPDP Ecuador* (uso moderado de datos, retención 10 días; comandos *mis datos* / *borrar mis datos*).\n\n`
+    ? `👋 ¡Hola! Soy el Asistente Virtual de *${tenant.name}* (${ctx.giro || 'Comercio'}), impulsado por *WaBot.AI 2079 EDGE*.\n` +
+      `🔒 *LOPDP Ecuador:* Uso moderado de datos (retención 10 días; escribe *mis datos* o *borrar mis datos*).\n\n`
     : '';
 
   if (/^(hola|buenas|buenos dias|buenas tardes|buenas noches|info|informacion)$/.test(clean)) {
-    const sample = (items || []).slice(0, 6).map(i => `• *${i.name}:* $${Number(i.price).toFixed(2)}`).join('\n');
+    const sample = items.slice(0, 6).map(i => `• *${i.name}:* $${Number(i.price).toFixed(2)}`).join('\n');
     return (
-      `${intro || `👋 ¡Bienvenido a *${tenant?.name || 'Local'}*!\n\n`}` +
-      `🕒 *Horario:* ${tenant?.open_time || '09:00'} - ${tenant?.close_time || '20:00'} | 📍 ${tenant?.address || tenant?.city || 'Ecuador'}\n\n` +
-      `📋 *Menú destacado:*\n${sample}\n\n` +
+      `${intro || `👋 ¡Bienvenido a *${tenant.name}*!\n\n`}` +
+      `🕒 *Horario:* ${tenant.open_time || '09:00'} - ${tenant.close_time || '20:00'} | 📍 ${tenant.address || tenant.city}\n\n` +
+      `📋 *Catálogo:*\n${sample}\n\n` +
       (isAllInOne ? `🍽️ *Menú Digital QR:* ${menuUrl}\n🌐 *Web:* ${webUrl}\n\n` : '') +
-      `¿Qué deseas pedir hoy? *(Si eres el dueño y deseas cambiar el giro o menú del bot, escribe **configurar**)*`
+      `¿Qué deseas pedir hoy? *(Escribe **configurar** si deseas actualizar el contexto del negocio)*`
     );
   }
 
   if (/^(menu|catalogo|precios|lista de precios|carta|que venden)$/.test(clean)) {
-    const list = (items || []).map(i => `• *${i.name}:* $${Number(i.price).toFixed(2)}`).join('\n');
-    return (
-      `${intro}📖 *MENÚ OFICIAL — ${tenant?.name || 'Local'}*\n\n${list}\n\n` +
-      `🚚 *Envío:* $${Number(ctx.costo_envio || 0).toFixed(2)}\n` +
-      (isAllInOne ? `🛒 *Pide en el Menú QR:* ${menuUrl}` : `Escribe los productos que deseas ordenar.`)
-    );
+    const list = items.map(i => `• *${i.name}:* $${Number(i.price).toFixed(2)}`).join('\n');
+    return `${intro}📖 *MENÚ OFICIAL — ${tenant.name}*\n\n${list}\n\n🚚 *Envío:* $${Number(ctx.costo_envio || 0).toFixed(2)}`;
   }
 
   if (/^(cuenta|deuna|transferencia|qr|datos bancarios|como pago|metodos de pago)$/.test(clean)) {
-    return (
-      `${intro}💳 *DATOS DE PAGO — ${tenant?.name || 'Local'}*\n\n` +
-      `• *Deuna! / Cuenta:* ${ctx.datos_bancarios || 'Solicitar confirmación al cerrar pedido'}\n` +
-      `• *Titular:* ${ctx.titular_cuenta_ocr || tenant?.name || 'Titular'}\n\n` +
-      `📸 Envía la captura de tu comprobante por aquí para validarlo con IA.`
-    );
+    return `${intro}💳 *DATOS DE PAGO — ${tenant.name}*\n\n• *Cuenta / Deuna!:* ${ctx.datos_bancarios || 'Confirmar al cerrar pedido'}\n• *Titular:* ${ctx.titular_cuenta_ocr || tenant.name}`;
   }
 
   return null;
 }
 
-function buildCompactSystemPrompt(tenant, items = [], includeIntro = false) {
-  const ctx = parseCustomContext(tenant.custom_context);
-  const compactCatalog = (items || []).map(i => `${i.name}:$${Number(i.price).toFixed(2)}`).join(' | ');
-  return `Asistente comercial de "${tenant?.name || 'Comercio'}" (${ctx.giro || 'Comercio'}, ${tenant?.address || tenant?.city || 'Ecuador'}, ${tenant?.open_time || '09:00'}-${tenant?.close_time || '20:00'}).
-${includeIntro ? 'Preséntate en 1 línea como Asistente IA de ' + tenant?.name + ' (WaBot.AI 2079, LOPDP retención 10 días).' : ''}
-Catálogo USD: ${compactCatalog}.
-Envío: $${Number(ctx.costo_envio || 0).toFixed(2)}. Pagos: ${ctx.datos_bancarios || 'Deuna/Transferencia'}.
-Responde en máximo 4 líneas, sin inventar precios ni productos.`;
-}
-
-// ============================================================================
-// 7. PROCESADOR DE MENSAJES ENTRANTES
-// ============================================================================
 async function processIncomingMessage({ senderPhone, text, msg, sendReply }) {
   const { data: tenant, items } = await getTenantBundle();
   if (!tenant) return;
 
   const cleanLower = (text || '').trim().toLowerCase();
-
   if (cleanLower === 'mis datos' || cleanLower === 'consultar mis datos') {
     const { data: arco } = await supabase.rpc('export_customer_data', { p_tenant: tenant.id, p_phone: senderPhone });
-    await sendReply(
-      `📄 *REPORTE LOPDP ECUADOR (Art. 13)*\n• *Teléfono:* +${senderPhone}\n• *Pedidos:* ${arco?.pedidos?.length || 0}\n• *Uso moderado (Art. 10):* Chats eliminados a los 10 días. Escribe *borrar mis datos* para anonimizar.`
-    );
+    await sendReply(`📄 *REPORTE LOPDP ECUADOR (Art. 13)*\n• *Teléfono:* +${senderPhone}\n• *Pedidos:* ${arco?.pedidos?.length || 0}\nEscribe *borrar mis datos* para anonimizar.`);
     return;
   }
-
   if (cleanLower === 'borrar mis datos' || cleanLower === 'eliminar mis datos') {
     await supabase.rpc('anonymize_customer', { p_tenant: tenant.id, p_phone: senderPhone });
     await sendReply(`🔒 *Datos anonimizados irreversiblemente (Art. 15 LOPDP Ecuador).*`);
     return;
   }
 
-  const handledBySetup = await handleAutonomousSetup({
-    ctx: { send: sendReply },
-    tenant,
-    items,
-    senderPhone,
-    text,
-    msg
-  });
+  const handledBySetup = await handleAutonomousSetup({ ctx: { send: sendReply }, tenant, items, senderPhone, text, msg });
   if (handledBySetup) return;
 
   const isFirstMsg = !greetedUsers.has(senderPhone);
@@ -504,7 +472,10 @@ async function processIncomingMessage({ senderPhone, text, msg, sendReply }) {
     return;
   }
 
-  const sysPrompt = buildCompactSystemPrompt(tenant, items, isFirstMsg);
+  const ctx = parseCustomContext(tenant.custom_context);
+  const compactCatalog = items.map(i => `${i.name}:$${Number(i.price).toFixed(2)}`).join(' | ');
+  const sysPrompt = `Asistente de "${tenant.name}" (${ctx.giro || 'Comercio'}). Catálogo USD: ${compactCatalog}. Envío: $${Number(ctx.costo_envio || 0).toFixed(2)}. Pagos: ${ctx.datos_bancarios || 'Deuna/Transferencia'}. Sé breve (máximo 4 líneas) y no inventes precios.`;
+
   try {
     const aiRes = await gemini({
       systemInstruction: sysPrompt,
@@ -526,32 +497,39 @@ async function processIncomingMessage({ senderPhone, text, msg, sendReply }) {
 }
 
 // ============================================================================
-// 8. MOTOR BAILEYS CON QR CRUDO NATIVO (SIN buildPairingQRData)
+// 6. MOTOR BAILEYS CON VERSIÓN 2.3000.x Y PAIRING CODE EN SOCKET FRESCO
 // ============================================================================
-async function startBot(forceWipe = false) {
+async function startBot(forceWipe = false, phoneForPairingCode = null) {
   if (isStartingSocket) return;
   isStartingSocket = true;
 
   try {
-    if (forceWipe) {
-      await wipeCorruptedSessionAndResetOnboarding();
+    if (phoneForPairingCode) {
+      pairingTargetPhone = normalizeEcuadorPhone(phoneForPairingCode);
+      latestPairingCode = null;
+      await wipeCorruptedSessionAndResetOnboarding(true);
+    } else if (forceWipe) {
+      await wipeCorruptedSessionAndResetOnboarding(false);
     } else {
       await restoreAuthFromSupabaseOnce();
     }
 
     const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
-    const { version } = await fetchLatestBaileysVersion();
+    const version = await getActiveWhatsAppVersion();
+    console.log(`[Baileys] Usando protocolo WhatsApp Web v${version.join('.')}`);
 
     const sock = makeWASocket({
       version,
       logger,
+      printQRInTerminal: false,
       auth: {
         creds: state.creds,
         keys: makeCacheableSignalKeyStore(state.keys, logger)
       },
-      browser: Browsers.ubuntu('Chrome'),
+      // IMPORTANTE: Tupla exacta requerida por WhatsApp para que requestPairingCode y QR NO den "Couldn't link device"
+      browser: ['Ubuntu', 'Chrome', '20.0.04'],
       syncFullHistory: false,
-      markOnlineOnConnect: true,
+      markOnlineOnConnect: false,
       generateHighQualityLinkPreview: false,
       connectTimeoutMs: 60000,
       defaultQueryTimeoutMs: 60000,
@@ -569,11 +547,24 @@ async function startBot(forceWipe = false) {
     sock.ev.on('connection.update', async (update) => {
       const { connection, lastDisconnect, qr } = update;
 
-      // USAR SIEMPRE EL STRING `qr` EXACTO Y CRUDO DE BAILEYS (NUNCA buildPairingQRData)
       if (typeof qr === 'string' && qr.length > 10) {
         latestQrData = qr;
         connectionStatus = 'qr_ready';
-        console.log(`[QR Emitido] Longitud=${qr.length} caracteres.`);
+
+        // Si el usuario solicitó vincular con Código de 8 dígitos, pedirlo en este primer evento QR del socket fresco
+        if (pairingTargetPhone && !latestPairingCode && !sock.authState?.creds?.registered) {
+          const targetPhone = pairingTargetPhone;
+          pairingTargetPhone = null; // Pedirlo una sola vez para no invalidar el código anterior
+          setTimeout(async () => {
+            try {
+              const rawCode = await sock.requestPairingCode(targetPhone);
+              latestPairingCode = rawCode?.match(/.{1,4}/g)?.join('-') || rawCode;
+              console.log(`[Pairing Code Generado] Para +${targetPhone}: ${latestPairingCode}`);
+            } catch (err) {
+              console.error('[Error requestPairingCode]:', err.message);
+            }
+          }, 500);
+        }
       }
 
       if (connection === 'close') {
@@ -581,21 +572,18 @@ async function startBot(forceWipe = false) {
         lastDisconnectCode = statusCode;
         console.warn(`[Socket Closed] statusCode=${statusCode}`);
 
-        // 1. Código 515 (restartRequired): Normal inmediatamente después de escanear el QR
+        // Reinicio 515 tras escanear QR o ingresar código de 8 dígitos: reconectar de inmediato sin borrar nada
         if (statusCode === DisconnectReason.restartRequired || statusCode === 515) {
-          setTimeout(() => startBot(false), 150);
+          setTimeout(() => startBot(false, null), 150);
           return;
         }
 
-        // 2. Código 440 (connectionReplaced): Otra instancia (ej. tu PC local) está peleando por la misma sesión
         if (statusCode === DisconnectReason.connectionReplaced || statusCode === 440) {
           connectionStatus = 'conflict_other_instance';
-          console.error('[Conflicto 440] Cierra cualquier terminal local de Node.js en tu PC para que Render no compita.');
-          setTimeout(() => startBot(false), 10000);
+          setTimeout(() => startBot(false, null), 10000);
           return;
         }
 
-        // 3. Sesión cerrada o inválida (401, 403, 500) -> Limpiar automáticamente y generar QR nuevo
         if (
           statusCode === DisconnectReason.loggedOut ||
           statusCode === DisconnectReason.badSession ||
@@ -604,19 +592,19 @@ async function startBot(forceWipe = false) {
           statusCode === 403 ||
           statusCode === 500
         ) {
-          setTimeout(() => startBot(true), 1000);
+          setTimeout(() => startBot(true, null), 1200);
           return;
         }
 
         connectionStatus = 'reconnecting';
-        setTimeout(() => startBot(false), 3000);
+        setTimeout(() => startBot(false, null), 3000);
       } else if (connection === 'open') {
         latestQrData = null;
         latestPairingCode = null;
+        pairingTargetPhone = null;
         connectionStatus = 'connected';
         scheduleBackupAuthToSupabase(2000);
 
-        // Enviar siempre el mensaje de presentación pidiendo el contexto al conectar
         try {
           const myJid = sock.user?.id?.replace(/:\d+@/, '@');
           const myPhone = (myJid || '').replace(/@.+$/, '').replace(/[^\d]/g, '');
@@ -625,7 +613,7 @@ async function startBot(forceWipe = false) {
             await sock.sendMessage(myJid, { text: buildBotSelfIntroductionPrompt() });
           }
         } catch (err) {
-          console.error('[Auto-Intro Error]:', err.message);
+          console.error('[Welcome Send Error]:', err.message);
         }
       }
     });
@@ -654,8 +642,8 @@ async function startBot(forceWipe = false) {
               if (sock && sock.user) {
                 await sock.sendMessage(remoteJid, { text: replyText });
               }
-            } catch (sendErr) {
-              console.error('[Send Reply Error]:', sendErr.message);
+            } catch (e) {
+              console.error('[Send Reply Error]:', e.message);
             }
           }
         });
@@ -667,7 +655,7 @@ async function startBot(forceWipe = false) {
 }
 
 // ============================================================================
-// 9. PANEL /qr CON NIVEL DE CORRECCIÓN 'L' (LECTURA INSTANTÁNEA EN WHATSAPP)
+// 7. SERVIDOR HTTP (/qr, /pair CON SOCKET FRESCO + FORMATO 593 AUTOMÁTICO)
 // ============================================================================
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://127.0.0.1:${PORT}`);
@@ -679,6 +667,7 @@ const server = http.createServer(async (req, res) => {
       connection_status: connectionStatus,
       last_disconnect_code: lastDisconnectCode,
       has_qr: Boolean(latestQrData),
+      pairing_code: latestPairingCode,
       user: sockInstance?.user?.id || null
     }));
     return;
@@ -696,22 +685,17 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // Vincular con código de 8 dígitos sobre un socket recién creado y con teléfono 593 normalizado
   if (url.pathname === '/pair' && url.searchParams.get('phone')) {
-    const phone = url.searchParams.get('phone').replace(/[^\d]/g, '');
-    try {
-      if (sockInstance && !sockInstance.authState?.creds?.registered) {
-        latestPairingCode = await sockInstance.requestPairingCode(phone);
-      }
-    } catch (e) {
-      console.error('[Pairing Code Error]:', e.message);
-    }
+    const cleanPhone = normalizeEcuadorPhone(url.searchParams.get('phone'));
+    await startBot(true, cleanPhone);
     res.writeHead(302, { Location: '/qr' });
     res.end();
     return;
   }
 
   if (url.pathname === '/qr' && url.searchParams.get('reset') === '1') {
-    await startBot(true);
+    await startBot(true, null);
     res.writeHead(302, { Location: '/qr' });
     res.end();
     return;
@@ -727,34 +711,39 @@ const server = http.createServer(async (req, res) => {
   <title>WaBot.AI 2079 EDGE — Vincular WhatsApp</title>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
   <style>
-    body { font-family: system-ui, sans-serif; background: #0f172a; color: #f8fafc; text-align: center; padding: 24px; }
-    .card { max-width: 500px; margin: 0 auto; background: #1e293b; padding: 26px; border-radius: 16px; }
+    body { font-family: system-ui, sans-serif; background: #0f172a; color: #f8fafc; text-align: center; padding: 20px; }
+    .card { max-width: 500px; margin: 0 auto; background: #1e293b; padding: 24px; border-radius: 16px; }
     #qr-box { display: inline-block; background: #ffffff; padding: 18px; border-radius: 12px; margin: 14px auto; }
     .btn { display: inline-block; background: #ef4444; color: #fff; text-decoration: none; padding: 11px 18px; border-radius: 10px; font-weight: 700; margin-top: 10px; border: none; cursor: pointer; }
-    .btn-pair { background: #38bdf8; color: #0f172a; }
-    input { padding: 10px; border-radius: 8px; border: 1px solid #475569; width: 65%; margin-top: 10px; }
-    .code-badge { font-size: 28px; font-weight: 800; letter-spacing: 5px; color: #22c55e; background: #0f172a; padding: 14px; border-radius: 10px; margin: 12px 0; }
+    .btn-pair { background: #22c55e; color: #052e16; width: 100%; font-size: 15px; }
+    input { padding: 12px; border-radius: 8px; border: 1px solid #475569; width: 90%; margin-top: 8px; font-size: 16px; text-align: center; }
+    .code-badge { font-size: 30px; font-weight: 800; letter-spacing: 5px; color: #22c55e; background: #0f172a; border: 2px solid #22c55e; padding: 16px; border-radius: 12px; margin: 14px 0; }
   </style>
 </head>
 <body>
   <div class="card">
-    <h2>🤖 WaBot.AI 2079 EDGE — Panel QR Oficial</h2>
-    <p id="status-text" style="color:#22c55e;font-weight:700;">Cargando estado...</p>
+    <h2>🤖 WaBot.AI 2079 EDGE — Vinculación Oficial</h2>
+    <p id="status-text" style="color:#22c55e;font-weight:700;">Verificando conexión...</p>
+
+    <div id="pair-container" style="display:none;">
+      <p style="color:#38bdf8;font-weight:700;margin-bottom:4px;">📲 Ingresa este código en tu WhatsApp ahora:</p>
+      <div id="pair-box" class="code-badge"></div>
+    </div>
+
     <div id="qr-container" style="display:none;">
       <div id="qr-box"></div>
-      <p style="font-size:12px;color:#94a3b8;">Nivel de corrección L (Óptimo para cámara de WhatsApp)</p>
     </div>
-    <div id="pair-box" style="display:none;" class="code-badge"></div>
+
+    <form action="/pair" method="GET" style="margin-top:14px;border-top:1px solid #334155;padding-top:14px;">
+      <p style="font-size:14px;color:#f8fafc;font-weight:700;margin:4px 0;">🔑 Vincular con Número de Teléfono (Código de 8 dígitos):</p>
+      <p style="font-size:12px;color:#94a3b8;margin:4px 0;">Puedes escribir 0983476198 o 593983476198 (se convierte automáticamente a 593 sin el 0):</p>
+      <input type="text" name="phone" placeholder="0983476198" required />
+      <button type="submit" class="btn btn-pair">Generar Código Nuevo de 8 Dígitos</button>
+    </form>
 
     <div style="margin-top:14px;border-top:1px solid #334155;padding-top:14px;">
-      <a class="btn" href="/qr?reset=1">🔄 Borrar Sesión + Pedir Contexto de Nuevo + Generar QR</a>
+      <a class="btn" href="/qr?reset=1">🔄 Limpiar Sesión y Generar Nuevo QR</a>
     </div>
-
-    <form action="/pair" method="GET" style="margin-top:16px;border-top:1px solid #334155;padding-top:14px;">
-      <p style="font-size:13px;color:#cbd5e1;margin:4px 0;">¿Prefieres vincular SIN escanear QR? Ingresa tu número con 593:</p>
-      <input type="text" name="phone" placeholder="Ej: 593983476198" required />
-      <button type="submit" class="btn btn-pair">Generar Código de 8 Dígitos</button>
-    </form>
   </div>
   <script>
     let currentQr = '';
@@ -765,43 +754,41 @@ const server = http.createServer(async (req, res) => {
         const qrContainer = document.getElementById('qr-container');
         const qrBox = document.getElementById('qr-box');
         const statusText = document.getElementById('status-text');
+        const pairContainer = document.getElementById('pair-container');
         const pairBox = document.getElementById('pair-box');
 
-        if (data.pairingCode) {
-          pairBox.style.display = 'block';
-          pairBox.textContent = data.pairingCode;
-        }
         if (data.status === 'connected') {
-          statusText.textContent = '✅ ¡WhatsApp Vinculado! Abre tu WhatsApp: el bot ya te envió el saludo pidiendo el contexto de tu negocio.';
+          statusText.textContent = '✅ ¡WhatsApp Vinculado con Éxito! Revisa tu WhatsApp: el bot ya te pidió el contexto de tu negocio.';
+          qrContainer.style.display = 'none';
+          pairContainer.style.display = 'none';
+          return;
+        }
+
+        if (data.pairingCode) {
+          pairContainer.style.display = 'block';
+          pairBox.textContent = data.pairingCode;
+          statusText.textContent = '✅ Código listo. En tu celular ve a Dispositivos vinculados > Vincular con el número de teléfono:';
           qrContainer.style.display = 'none';
           return;
         }
+
         if (data.qr) {
-          statusText.textContent = '📲 Apunta la cámara de WhatsApp > Dispositivos vinculados:';
+          statusText.textContent = '📲 Escanea este QR o pide abajo un código de 8 dígitos:';
           qrContainer.style.display = 'block';
           if (data.qr !== currentQr) {
             currentQr = data.qr;
             qrBox.innerHTML = '';
             try {
-              // CRÍTICO: Usar CorrectLevel.L para cadenas largas de Baileys (CorrectLevel.H satura el QR y da error al escanear)
-              new QRCode(qrBox, {
-                text: data.qr,
-                width: 260,
-                height: 260,
-                correctLevel: QRCode.CorrectLevel.L
-              });
+              new QRCode(qrBox, { text: data.qr, width: 256, height: 256, correctLevel: QRCode.CorrectLevel.L });
             } catch (err) {
-              // Fallback a imagen PNG limpia con margen blanco si qrcodejs falla
-              qrBox.innerHTML = '<img src="https://api.qrserver.com/v1/create-qr-code/?size=260x260&ecc=L&margin=10&data=' + encodeURIComponent(data.qr) + '" width="260" height="260" />';
+              qrBox.innerHTML = '<img src="https://api.qrserver.com/v1/create-qr-code/?size=256x256&ecc=L&margin=10&data=' + encodeURIComponent(data.qr) + '" width="256" height="256" />';
             }
           }
-        } else {
-          statusText.textContent = '⏳ Generando QR... Toca el botón rojo de abajo para forzar un QR limpio.';
         }
       } catch (e) {}
     }
     pollQr();
-    setInterval(pollQr, 2500);
+    setInterval(pollQr, 2000);
   </script>
 </body>
 </html>`);
@@ -822,5 +809,5 @@ function startExternalKeepAlive() {
 server.listen(PORT, HOST, () => {
   console.log(`[WaBot.AI 2079 EDGE] Servidor activo en puerto ${PORT}`);
   startExternalKeepAlive();
-  startBot(false);
+  startBot(false, null);
 });
